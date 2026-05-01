@@ -13,6 +13,8 @@ public sealed class MidiDeviceManager : IDisposable
     public event EventHandler<MidiMessageEventArgs>? MessageReceived;
     public bool InputOpen => _midiIn != IntPtr.Zero;
     public bool OutputOpen => _midiOut != IntPtr.Zero;
+    public string OpenInputName { get; private set; } = "";
+    public string OpenOutputName { get; private set; } = "";
 
     public MidiDeviceManager(FileLogger logger)
     {
@@ -61,6 +63,7 @@ public sealed class MidiDeviceManager : IDisposable
                 throw new InvalidOperationException(MidiInterop.MidiInError(result));
 
             _logger.Info("Opened MIDI input {0}", input.Name);
+            OpenInputName = input.Name;
         }
 
         if (output is not null)
@@ -70,10 +73,16 @@ public sealed class MidiDeviceManager : IDisposable
                 throw new InvalidOperationException(MidiInterop.MidiOutError(result));
 
             _logger.Info("Opened MIDI output {0}", output.Name);
+            OpenOutputName = output.Name;
         }
 
         if (input is null && output is null)
             throw new InvalidOperationException("No matching MIDI input or output devices were selected.");
+
+        if (input is null)
+            _logger.Warn("No matching MIDI input device found for '{0}'", inputName);
+        if (output is null)
+            _logger.Warn("No matching MIDI output device found for '{0}'", outputName);
     }
 
     public void SendShort(int status, int data1, int data2)
@@ -176,6 +185,7 @@ public sealed class MidiDeviceManager : IDisposable
             MidiInterop.midiInStop(_midiIn);
             MidiInterop.midiInClose(_midiIn);
             _midiIn = IntPtr.Zero;
+            OpenInputName = "";
             _logger.Info("Closed MIDI input");
         }
 
@@ -183,6 +193,7 @@ public sealed class MidiDeviceManager : IDisposable
         {
             MidiInterop.midiOutClose(_midiOut);
             _midiOut = IntPtr.Zero;
+            OpenOutputName = "";
             _logger.Info("Closed MIDI output");
         }
     }

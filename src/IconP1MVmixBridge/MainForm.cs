@@ -25,10 +25,12 @@ public sealed class MainForm : Form
     private readonly Button _connectButton = new();
     private readonly Button _saveButton = new();
     private readonly Button _refreshVmixButton = new();
+    private readonly Button _openMidiButton = new();
     private VMixState _state = new();
     private CancellationTokenSource? _pollCts;
     private bool _connected;
     private bool _updatingGrid;
+    private string _lastMidiMessage = "none";
     private readonly DateTime[] _lastFaderTouch = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
 
     public MainForm(FileLogger logger)
@@ -61,7 +63,7 @@ public sealed class MainForm : Form
             RowCount = 4,
             Padding = new Padding(12)
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 128));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 132));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
@@ -97,12 +99,14 @@ public sealed class MainForm : Form
         _motorFeedback.Checked = true;
         _displayText.Text = "Display text feedback";
         _displayText.Checked = true;
-        _connectButton.Text = "Connect";
+        _connectButton.Text = "Start Bridge";
         _connectButton.Click += (_, _) => ToggleConnection();
         _saveButton.Text = "Save Profile";
         _saveButton.Click += (_, _) => SaveProfile();
         _refreshVmixButton.Text = "Refresh vMix";
         _refreshVmixButton.Click += async (_, _) => await RefreshVmixInputsAsync();
+        _openMidiButton.Text = "Open MIDI";
+        _openMidiButton.Click += (_, _) => ToggleMidi();
         var refreshMidi = new Button { Text = "Refresh MIDI", Dock = DockStyle.Fill };
         refreshMidi.Click += (_, _) => RefreshMidiDevices();
 
@@ -112,7 +116,7 @@ public sealed class MainForm : Form
         settings.SetColumnSpan(_displayText, 2);
         settings.Controls.Add(refreshMidi, 4, 2);
         settings.Controls.Add(_refreshVmixButton, 5, 2);
-        settings.Controls.Add(_saveButton, 6, 2);
+        settings.Controls.Add(_openMidiButton, 6, 2);
         settings.Controls.Add(_connectButton, 7, 2);
 
         ConfigureGrid();
@@ -120,6 +124,7 @@ public sealed class MainForm : Form
 
         _statusLabel.Dock = DockStyle.Fill;
         _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
+        _statusLabel.AutoEllipsis = true;
         root.Controls.Add(_statusLabel, 0, 2);
 
         _logLabel.Dock = DockStyle.Fill;
@@ -249,6 +254,7 @@ public sealed class MainForm : Form
         _midiInputCombo.Text = PickDeviceText(_midiInputCombo, _profile.MidiInputName, inputName);
         _midiOutputCombo.Text = PickDeviceText(_midiOutputCombo, _profile.MidiOutputName, outputName);
         _logger.Info("MIDI refresh complete. Inputs: {0}, outputs: {1}", _midiInputCombo.Items.Count, _midiOutputCombo.Items.Count);
+        UpdateStatus();
     }
 
     private static string PickDeviceText(ComboBox combo, string saved, string previous)
@@ -290,9 +296,10 @@ public sealed class MainForm : Form
             _pollTimer.Interval = _profile.PollIntervalMs;
             _pollTimer.Start();
             _connected = true;
-            _connectButton.Text = "Disconnect";
-            _statusLabel.Text = "Connected to MIDI. Waiting for vMix state...";
+            _connectButton.Text = "Stop Bridge";
+            _openMidiButton.Text = "Close MIDI";
             _logger.Info("Bridge connected");
+            UpdateStatus();
             _ = PollOnceAsync();
         }
         catch (Exception ex)
@@ -311,9 +318,38 @@ public sealed class MainForm : Form
         _pollCts = null;
         _midi.Close();
         _connected = false;
-        _connectButton.Text = "Connect";
-        _statusLabel.Text = "Disconnected";
+        _connectButton.Text = "Start Bridge";
+        _openMidiButton.Text = "Open MIDI";
+        UpdateStatus();
         _logger.Info("Bridge disconnected");
+    }
+
+    private void ToggleMidi()
+    {
+        try
+        {
+            if (_midi.InputOpen || _midi.OutputOpen)
+            {
+                _midi.Close();
+                _openMidiButton.Text = "Open MIDI";
+                _lastMidiMessage = "none";
+                UpdateStatus();
+                return;
+            }
+
+            SaveProfile();
+            _midi.Open(_profile.MidiInputName, _profile.MidiOutputName);
+            _openMidiButton.Text = "Close MIDI";
+            _logger.Info("MIDI opened from UI. Input open: {0}, output open: {1}", _midi.InputOpen, _midi.OutputOpen);
+            UpdateStatus();
+            UpdateLiveGridAndHardware();
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Open MIDI failed");
+            UpdateStatus($"MIDI open failed: {ex.Message}");
+            MessageBox.Show(this, ex.Message, "Open MIDI failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
     }
 
     private async Task PollOnceAsync()
@@ -337,16 +373,29 @@ public sealed class MainForm : Form
         try
         {
             _state = await _vmix.GetStateAsync(cancellationToken);
-            _statusLabel.Text = $"{_state.Status} MIDI in: {_midi.InputOpen}. MIDI out: {_midi.OutputOpen}.";
             UpdateInputColumnDataSource();
             UpdateLiveGridAndHardware();
+            UpdateStatus();
         }
         catch (Exception ex)
         {
             _logger.Error(ex, "Poll failed");
-            _statusLabel.Text = $"Poll failed: {ex.Message}";
+            UpdateStatus($"vMix poll failed: {ex.Message}");
         }
     }
+
+    private void UpdateStatus(string? alert = null)
+    {
+        var midiInput = _midi.InputOpen ? $"open ({_midi.OpenInputName})" : $"closed (selected: {EmptyIfBlank(_midiInputCombo.Text)})";
+        var midiOutput = _midi.OutputOpen ? $"open ({_midi.OpenOutputName})" : $"closed (selected: {EmptyIfBlank(_midiOutputCombo.Text)})";
+        var bridge = _connected ? "running" : "stopped";
+        var vmix = _state.Connected ? _state.Status : $"vMix not connected: {_state.Status}";
+        _statusLabel.Text = alert is null
+            ? $"Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput} | Last MIDI: {_lastMidiMessage}"
+            : $"{alert} | Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput}";
+    }
+
+    private static string EmptyIfBlank(string value) => string.IsNullOrWhiteSpace(value) ? "<none>" : value.Trim();
 
     private void UpdateInputColumnDataSource()
     {
@@ -470,10 +519,17 @@ public sealed class MainForm : Form
     private async void OnMidiMessageReceived(object? sender, MidiMessageEventArgs e)
     {
         if (!_connected || _pollCts?.IsCancellationRequested != false)
+        {
+            _lastMidiMessage = $"ignored {e.Status:X2} {e.Data1:X2} {e.Data2:X2}";
+            _logger.Debug("MIDI ignored while bridge stopped: status {0:X2}, data1 {1:X2}, data2 {2:X2}, channel {3}", e.Status, e.Data1, e.Data2, e.Channel + 1);
+            BeginInvoke(new MethodInvoker(() => UpdateStatus()));
             return;
+        }
 
         try
         {
+            _lastMidiMessage = $"{e.Status:X2} {e.Data1:X2} {e.Data2:X2} ch {e.Channel + 1}";
+            _logger.Debug("MIDI received: status {0:X2}, data1 {1:X2}, data2 {2:X2}, channel {3}, command {4:X2}", e.Status, e.Data1, e.Data2, e.Channel + 1, e.Command);
             var assignments = ReadAssignmentsFromGrid();
             if (e.Command == 0xE0 && e.Channel is >= 0 and < 8)
             {
@@ -482,18 +538,24 @@ public sealed class MainForm : Form
                 _lastFaderTouch[e.Channel] = DateTime.Now;
                 _logger.Debug("MIDI fader ch {0}: {1:0.##}", e.Channel + 1, percent);
                 await _vmix.SetAssignmentVolumeAsync(assignments[e.Channel], percent, _pollCts.Token);
+                BeginInvoke(new MethodInvoker(() => UpdateStatus()));
             }
             else if (e.Command == 0x90 && e.Data2 > 0 && e.Data1 is >= 16 and <= 23)
             {
                 var channel = e.Data1 - 16;
                 _logger.Debug("MIDI mute button ch {0}", channel + 1);
                 await _vmix.ToggleMuteAsync(assignments[channel], _pollCts.Token);
+                BeginInvoke(new MethodInvoker(() => UpdateStatus()));
+            }
+            else
+            {
+                BeginInvoke(new MethodInvoker(() => UpdateStatus("MIDI received, but not mapped to a fader/mute action")));
             }
         }
         catch (Exception ex)
         {
             _logger.Error(ex, "MIDI action failed. Raw message {0:X6}", e.RawMessage);
-            BeginInvoke(new MethodInvoker(() => _statusLabel.Text = $"MIDI action failed: {ex.Message}"));
+            BeginInvoke(new MethodInvoker(() => UpdateStatus($"MIDI action failed: {ex.Message}")));
         }
     }
 
