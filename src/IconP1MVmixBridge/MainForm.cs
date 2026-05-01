@@ -24,6 +24,7 @@ public sealed class MainForm : Form
     private readonly Label _logLabel = new();
     private readonly Button _connectButton = new();
     private readonly Button _saveButton = new();
+    private readonly Button _refreshVmixButton = new();
     private VMixState _state = new();
     private CancellationTokenSource? _pollCts;
     private bool _connected;
@@ -49,6 +50,7 @@ public sealed class MainForm : Form
         ConfigurePollTimer();
 
         _logger.Info("Main window loaded");
+        BeginInvoke(new MethodInvoker(async () => await RefreshVmixInputsAsync()));
     }
 
     private void BuildUi()
@@ -100,6 +102,8 @@ public sealed class MainForm : Form
         _connectButton.Click += (_, _) => ToggleConnection();
         _saveButton.Text = "Save Profile";
         _saveButton.Click += (_, _) => SaveProfile();
+        _refreshVmixButton.Text = "Refresh vMix";
+        _refreshVmixButton.Click += async (_, _) => await RefreshVmixInputsAsync();
         var refreshMidi = new Button { Text = "Refresh MIDI", Dock = DockStyle.Fill };
         refreshMidi.Click += (_, _) => RefreshMidiDevices();
 
@@ -108,9 +112,9 @@ public sealed class MainForm : Form
         settings.Controls.Add(_displayText, 2, 2);
         settings.SetColumnSpan(_displayText, 2);
         settings.Controls.Add(refreshMidi, 4, 2);
-        settings.Controls.Add(_saveButton, 5, 2);
-        settings.Controls.Add(_connectButton, 6, 2);
-        settings.SetColumnSpan(_connectButton, 2);
+        settings.Controls.Add(_refreshVmixButton, 5, 2);
+        settings.Controls.Add(_saveButton, 6, 2);
+        settings.Controls.Add(_connectButton, 7, 2);
 
         ConfigureGrid();
         root.Controls.Add(_grid, 0, 1);
@@ -148,6 +152,11 @@ public sealed class MainForm : Form
         _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
         _grid.CellValueChanged += (_, _) => { if (!_updatingGrid) SaveProfile(); };
+        _grid.DataError += (_, e) =>
+        {
+            _logger.Warn("Grid data error at row {0}, column {1}: {2}", e.RowIndex, e.ColumnIndex, e.Exception?.Message ?? "Unknown error");
+            e.ThrowException = false;
+        };
         _grid.CurrentCellDirtyStateChanged += (_, _) =>
         {
             if (_grid.IsCurrentCellDirty)
@@ -307,9 +316,22 @@ public sealed class MainForm : Form
         if (_pollCts?.IsCancellationRequested != false)
             return;
 
+        await RefreshVmixStateAsync(_pollCts.Token);
+    }
+
+    private async Task RefreshVmixInputsAsync()
+    {
+        SaveProfile();
+        _vmix.Configure(_profile.VMixHost, _profile.VMixHttpPort, _profile.VMixTcpPort);
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(3));
+        await RefreshVmixStateAsync(cts.Token);
+    }
+
+    private async Task RefreshVmixStateAsync(CancellationToken cancellationToken)
+    {
         try
         {
-            _state = await _vmix.GetStateAsync(_pollCts.Token);
+            _state = await _vmix.GetStateAsync(cancellationToken);
             _statusLabel.Text = $"{_state.Status} MIDI in: {_midi.InputOpen}. MIDI out: {_midi.OutputOpen}.";
             UpdateInputColumnDataSource();
             UpdateLiveGridAndHardware();
@@ -323,9 +345,11 @@ public sealed class MainForm : Form
 
     private void UpdateInputColumnDataSource()
     {
-        var choices = _state.Inputs.Count == 0
-            ? new List<InputChoice> { new("", "No vMix inputs loaded") }
-            : _state.Inputs.Select(input => new InputChoice(input.Key, $"{input.Number}: {input.Title}")).ToList();
+        var choices = new List<InputChoice>
+        {
+            new("", _state.Inputs.Count == 0 ? "No vMix inputs loaded" : "(none)")
+        };
+        choices.AddRange(_state.Inputs.Select(input => new InputChoice(input.Key, $"{input.Number}: {input.Title}")));
 
         if (_grid.Columns["InputKey"] is DataGridViewComboBoxColumn combo)
             combo.DataSource = choices;
