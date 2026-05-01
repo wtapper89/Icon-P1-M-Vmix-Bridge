@@ -23,6 +23,7 @@ public sealed class MainForm : Form
     private readonly Label _statusLabel = new();
     private readonly Label _logLabel = new();
     private readonly Button _connectButton = new();
+    private readonly Button _stopBridgeButton = new();
     private readonly Button _saveButton = new();
     private readonly Button _refreshVmixButton = new();
     private readonly Button _openMidiButton = new();
@@ -61,10 +62,11 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 1,
-            RowCount = 4,
+            RowCount = 5,
             Padding = new Padding(12)
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 132));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
@@ -74,7 +76,7 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 10,
-            RowCount = 3
+            RowCount = 2
         };
         for (var i = 0; i < 10; i++)
             settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 10f));
@@ -105,6 +107,9 @@ public sealed class MainForm : Form
         _displayText.Checked = true;
         _connectButton.Text = "Start Bridge";
         _connectButton.Click += (_, _) => ToggleConnection();
+        _stopBridgeButton.Text = "Stop Bridge";
+        _stopBridgeButton.Enabled = false;
+        _stopBridgeButton.Click += (_, _) => Disconnect();
         _saveButton.Text = "Save Profile";
         _saveButton.Click += (_, _) => SaveProfile();
         _refreshVmixButton.Text = "Refresh vMix";
@@ -116,31 +121,44 @@ public sealed class MainForm : Form
         var refreshMidi = new Button { Text = "Refresh MIDI", Dock = DockStyle.Fill };
         refreshMidi.Click += (_, _) => RefreshMidiDevices();
 
-        settings.Controls.Add(_motorFeedback, 0, 2);
-        settings.SetColumnSpan(_motorFeedback, 2);
-        settings.Controls.Add(_displayText, 2, 2);
-        settings.SetColumnSpan(_displayText, 2);
-        settings.Controls.Add(refreshMidi, 4, 2);
-        settings.Controls.Add(_refreshVmixButton, 5, 2);
-        settings.Controls.Add(_saveButton, 6, 2);
-        settings.Controls.Add(_openMidiButton, 7, 2);
-        settings.Controls.Add(_testMidiButton, 8, 2);
-        settings.Controls.Add(_connectButton, 9, 2);
+        var commandBar = new FlowLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            FlowDirection = FlowDirection.LeftToRight,
+            WrapContents = false,
+            Padding = new Padding(0, 6, 0, 4)
+        };
+        commandBar.Controls.Add(refreshMidi);
+        commandBar.Controls.Add(_refreshVmixButton);
+        commandBar.Controls.Add(_saveButton);
+        commandBar.Controls.Add(_openMidiButton);
+        commandBar.Controls.Add(_testMidiButton);
+        commandBar.Controls.Add(_connectButton);
+        commandBar.Controls.Add(_stopBridgeButton);
+        commandBar.Controls.Add(_motorFeedback);
+        commandBar.Controls.Add(_displayText);
+        foreach (Control control in commandBar.Controls)
+        {
+            control.Width = control is CheckBox ? 150 : 104;
+            control.Height = 28;
+            control.Margin = new Padding(0, 0, 8, 0);
+        }
+        root.Controls.Add(commandBar, 0, 1);
 
         ConfigureGrid();
-        root.Controls.Add(_grid, 0, 1);
+        root.Controls.Add(_grid, 0, 2);
 
         _statusLabel.Dock = DockStyle.Fill;
         _statusLabel.TextAlign = ContentAlignment.MiddleLeft;
         _statusLabel.AutoEllipsis = true;
-        root.Controls.Add(_statusLabel, 0, 2);
+        root.Controls.Add(_statusLabel, 0, 3);
 
         _logLabel.Dock = DockStyle.Fill;
         _logLabel.TextAlign = ContentAlignment.MiddleLeft;
         _logLabel.Text = $"Logs: {_logger.CurrentLogFile}";
         _logLabel.Cursor = Cursors.Hand;
         _logLabel.Click += (_, _) => Process.Start("explorer.exe", $"/select,\"{_logger.CurrentLogFile}\"");
-        root.Controls.Add(_logLabel, 0, 3);
+        root.Controls.Add(_logLabel, 0, 4);
     }
 
     private static void AddLabeled(TableLayoutPanel panel, string label, Control control, int column, int row, int span = 2)
@@ -386,7 +404,8 @@ public sealed class MainForm : Form
             _pollTimer.Interval = _profile.PollIntervalMs;
             _pollTimer.Start();
             _connected = true;
-            _connectButton.Text = "Stop Bridge";
+            _connectButton.Enabled = false;
+            _stopBridgeButton.Enabled = true;
             _openMidiButton.Text = "Close MIDI";
             _logger.Info("Bridge connected");
             UpdateStatus();
@@ -408,7 +427,8 @@ public sealed class MainForm : Form
         _pollCts = null;
         _midi.Close();
         _connected = false;
-        _connectButton.Text = "Start Bridge";
+        _connectButton.Enabled = true;
+        _stopBridgeButton.Enabled = false;
         _openMidiButton.Text = "Open MIDI";
         UpdateStatus();
         _logger.Info("Bridge disconnected");
