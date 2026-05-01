@@ -50,7 +50,6 @@ public sealed class MainForm : Form
         ConfigurePollTimer();
 
         _logger.Info("Main window loaded");
-        BeginInvoke(new MethodInvoker(async () => await RefreshVmixInputsAsync()));
     }
 
     private void BuildUi()
@@ -266,6 +265,12 @@ public sealed class MainForm : Form
     {
         _pollTimer.Interval = (int)_pollMs.Value;
         _pollTimer.Tick += async (_, _) => await PollOnceAsync();
+    }
+
+    protected override async void OnShown(EventArgs e)
+    {
+        base.OnShown(e);
+        await RefreshVmixInputsAsync();
     }
 
     private void ToggleConnection()
