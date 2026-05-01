@@ -26,6 +26,7 @@ public sealed class MainForm : Form
     private readonly Button _saveButton = new();
     private readonly Button _refreshVmixButton = new();
     private readonly Button _openMidiButton = new();
+    private readonly Button _testMidiButton = new();
     private VMixState _state = new();
     private CancellationTokenSource? _pollCts;
     private bool _connected;
@@ -72,20 +73,20 @@ public sealed class MainForm : Form
         var settings = new TableLayoutPanel
         {
             Dock = DockStyle.Fill,
-            ColumnCount = 8,
+            ColumnCount = 10,
             RowCount = 3
         };
-        for (var i = 0; i < 8; i++)
-            settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 12.5f));
+        for (var i = 0; i < 10; i++)
+            settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 10f));
 
         root.Controls.Add(settings, 0, 0);
 
-        AddLabeled(settings, "vMix Host", _hostText, 0, 0);
-        AddLabeled(settings, "HTTP Port", _httpPort, 2, 0);
-        AddLabeled(settings, "TCP Port", _tcpPort, 4, 0);
-        AddLabeled(settings, "Poll ms", _pollMs, 6, 0);
-        AddLabeled(settings, "MIDI Input", _midiInputCombo, 0, 1, 4);
-        AddLabeled(settings, "MIDI Output", _midiOutputCombo, 4, 1, 4);
+        AddLabeled(settings, "vMix Host", _hostText, 0, 0, 3);
+        AddLabeled(settings, "HTTP Port", _httpPort, 3, 0, 2);
+        AddLabeled(settings, "TCP Port", _tcpPort, 5, 0, 2);
+        AddLabeled(settings, "Poll ms", _pollMs, 7, 0, 3);
+        AddLabeled(settings, "MIDI Input", _midiInputCombo, 0, 1, 5);
+        AddLabeled(settings, "MIDI Output", _midiOutputCombo, 5, 1, 5);
 
         _httpPort.Minimum = 1;
         _httpPort.Maximum = 65535;
@@ -94,6 +95,9 @@ public sealed class MainForm : Form
         _pollMs.Minimum = 100;
         _pollMs.Maximum = 5000;
         _pollMs.Increment = 50;
+        _midiInputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        _midiOutputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
+        _midiInputCombo.SelectedIndexChanged += (_, _) => SuggestMatchingMidiOutput();
 
         _motorFeedback.Text = "Motor fader feedback";
         _motorFeedback.Checked = true;
@@ -107,6 +111,8 @@ public sealed class MainForm : Form
         _refreshVmixButton.Click += async (_, _) => await RefreshVmixInputsAsync();
         _openMidiButton.Text = "Open MIDI";
         _openMidiButton.Click += (_, _) => ToggleMidi();
+        _testMidiButton.Text = "Test MIDI";
+        _testMidiButton.Click += (_, _) => TestMidiOutput();
         var refreshMidi = new Button { Text = "Refresh MIDI", Dock = DockStyle.Fill };
         refreshMidi.Click += (_, _) => RefreshMidiDevices();
 
@@ -116,8 +122,10 @@ public sealed class MainForm : Form
         settings.SetColumnSpan(_displayText, 2);
         settings.Controls.Add(refreshMidi, 4, 2);
         settings.Controls.Add(_refreshVmixButton, 5, 2);
-        settings.Controls.Add(_openMidiButton, 6, 2);
-        settings.Controls.Add(_connectButton, 7, 2);
+        settings.Controls.Add(_saveButton, 6, 2);
+        settings.Controls.Add(_openMidiButton, 7, 2);
+        settings.Controls.Add(_testMidiButton, 8, 2);
+        settings.Controls.Add(_connectButton, 9, 2);
 
         ConfigureGrid();
         root.Controls.Add(_grid, 0, 1);
@@ -247,13 +255,20 @@ public sealed class MainForm : Form
         _midiInputCombo.Items.Clear();
         _midiOutputCombo.Items.Clear();
         foreach (var input in MidiDeviceManager.GetInputs())
+        {
             _midiInputCombo.Items.Add(input.Name);
+            _logger.Info("MIDI input device: {0}: {1}", input.Id, input.Name);
+        }
         foreach (var output in MidiDeviceManager.GetOutputs())
+        {
             _midiOutputCombo.Items.Add(output.Name);
+            _logger.Info("MIDI output device: {0}: {1}", output.Id, output.Name);
+        }
 
         _midiInputCombo.Text = PickDeviceText(_midiInputCombo, _profile.MidiInputName, inputName);
-        _midiOutputCombo.Text = PickDeviceText(_midiOutputCombo, _profile.MidiOutputName, outputName);
+        _midiOutputCombo.Text = PickMidiOutputText(_midiOutputCombo, _profile.MidiOutputName, outputName, _midiInputCombo.Text);
         _logger.Info("MIDI refresh complete. Inputs: {0}, outputs: {1}", _midiInputCombo.Items.Count, _midiOutputCombo.Items.Count);
+        _logger.Info("Selected MIDI input '{0}', output '{1}'", _midiInputCombo.Text, _midiOutputCombo.Text);
         UpdateStatus();
     }
 
@@ -264,8 +279,78 @@ public sealed class MainForm : Form
             if (!string.IsNullOrWhiteSpace(candidate) && combo.Items.Contains(candidate))
                 return candidate;
         }
+        foreach (var item in combo.Items.Cast<object>().Select(item => item.ToString() ?? ""))
+        {
+            if (LooksLikeIconDevice(item))
+                return item;
+        }
         return combo.Items.Count > 0 ? combo.Items[0]?.ToString() ?? "" : "";
     }
+
+    private static string PickMidiOutputText(ComboBox combo, string saved, string previous, string selectedInput)
+    {
+        foreach (var candidate in new[] { saved, previous })
+        {
+            if (!string.IsNullOrWhiteSpace(candidate) &&
+                combo.Items.Contains(candidate) &&
+                !IsMicrosoftSynth(candidate))
+            {
+                return candidate;
+            }
+        }
+
+        foreach (var item in combo.Items.Cast<object>().Select(item => item.ToString() ?? ""))
+        {
+            if (SameIconFamily(item, selectedInput))
+                return item;
+        }
+
+        foreach (var item in combo.Items.Cast<object>().Select(item => item.ToString() ?? ""))
+        {
+            if (LooksLikeIconDevice(item) && !IsMicrosoftSynth(item))
+                return item;
+        }
+
+        foreach (var item in combo.Items.Cast<object>().Select(item => item.ToString() ?? ""))
+        {
+            if (!IsMicrosoftSynth(item))
+                return item;
+        }
+
+        return "";
+    }
+
+    private void SuggestMatchingMidiOutput()
+    {
+        if (_midiOutputCombo.Items.Count == 0)
+            return;
+
+        if (string.IsNullOrWhiteSpace(_midiOutputCombo.Text) || IsMicrosoftSynth(_midiOutputCombo.Text))
+            _midiOutputCombo.Text = PickMidiOutputText(_midiOutputCombo, "", "", _midiInputCombo.Text);
+    }
+
+    private static bool LooksLikeIconDevice(string name) =>
+        name.Contains("iCON", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("P1", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("V1", StringComparison.OrdinalIgnoreCase) ||
+        name.Contains("MIDIIN", StringComparison.OrdinalIgnoreCase) && name.Contains("P1", StringComparison.OrdinalIgnoreCase);
+
+    private static bool SameIconFamily(string output, string input)
+    {
+        if (string.IsNullOrWhiteSpace(output) || string.IsNullOrWhiteSpace(input))
+            return false;
+        if (!LooksLikeIconDevice(output) || IsMicrosoftSynth(output))
+            return false;
+
+        var normalizedInput = input
+            .Replace("MIDIIN", "", StringComparison.OrdinalIgnoreCase)
+            .Replace("MIDIOUT", "", StringComparison.OrdinalIgnoreCase)
+            .Trim();
+        return output.Contains(normalizedInput, StringComparison.OrdinalIgnoreCase) ||
+            normalizedInput.Contains("P1", StringComparison.OrdinalIgnoreCase) && output.Contains("P1", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static bool IsMicrosoftSynth(string name) => name.Contains("Microsoft GS Wavetable", StringComparison.OrdinalIgnoreCase);
 
     private void ConfigurePollTimer()
     {
@@ -290,8 +375,13 @@ public sealed class MainForm : Form
         try
         {
             SaveProfile();
+            if (IsMicrosoftSynth(_profile.MidiOutputName))
+                throw new InvalidOperationException("The selected MIDI output is Microsoft GS Wavetable Synth. Select the iCON P1-M output port instead.");
+
             _vmix.Configure(_profile.VMixHost, _profile.VMixHttpPort, _profile.VMixTcpPort);
             _midi.Open(_profile.MidiInputName, _profile.MidiOutputName);
+            if (!_midi.InputOpen || !_midi.OutputOpen)
+                throw new InvalidOperationException($"MIDI did not fully open. Input open: {_midi.InputOpen}. Output open: {_midi.OutputOpen}. Check selected P1-M ports.");
             _pollCts = new CancellationTokenSource();
             _pollTimer.Interval = _profile.PollIntervalMs;
             _pollTimer.Start();
@@ -338,6 +428,9 @@ public sealed class MainForm : Form
             }
 
             SaveProfile();
+            if (IsMicrosoftSynth(_profile.MidiOutputName))
+                throw new InvalidOperationException("The selected MIDI output is Microsoft GS Wavetable Synth. Select the iCON P1-M output port instead.");
+
             _midi.Open(_profile.MidiInputName, _profile.MidiOutputName);
             _openMidiButton.Text = "Close MIDI";
             _logger.Info("MIDI opened from UI. Input open: {0}, output open: {1}", _midi.InputOpen, _midi.OutputOpen);
@@ -349,6 +442,33 @@ public sealed class MainForm : Form
             _logger.Error(ex, "Open MIDI failed");
             UpdateStatus($"MIDI open failed: {ex.Message}");
             MessageBox.Show(this, ex.Message, "Open MIDI failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
+    private void TestMidiOutput()
+    {
+        try
+        {
+            if (!_midi.OutputOpen)
+                ToggleMidi();
+
+            if (!_midi.OutputOpen)
+                throw new InvalidOperationException("MIDI output is still closed after attempting to open it.");
+
+            for (var i = 0; i < 8; i++)
+            {
+                _midi.SendMackieScribbleText(i, $"VMIX {i + 1}");
+                _midi.SendPitchBend(i, PercentToFourteenBit(i % 2 == 0 ? 75 : 25));
+                _midi.SendMackieMeter(i, 8);
+            }
+            _logger.Info("Sent MIDI hardware test to output '{0}'", _midi.OpenOutputName);
+            UpdateStatus("Sent MIDI test: labels VMIX 1-8, alternating faders, meters");
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "MIDI test failed");
+            UpdateStatus($"MIDI test failed: {ex.Message}");
+            MessageBox.Show(this, ex.Message, "MIDI test failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
     }
 
