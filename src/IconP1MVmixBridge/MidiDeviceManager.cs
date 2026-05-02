@@ -9,6 +9,7 @@ public sealed class MidiDeviceManager : IDisposable
     private readonly MidiInterop.MidiInProc _midiInProc;
     private IntPtr _midiIn = IntPtr.Zero;
     private IntPtr _midiOut = IntPtr.Zero;
+    private byte[] _lastDisplayColorPacket = [];
 
     public event EventHandler<MidiMessageEventArgs>? MessageReceived;
     public bool InputOpen => _midiIn != IntPtr.Zero;
@@ -134,6 +135,36 @@ public sealed class MidiDeviceManager : IDisposable
         _logger.Debug("Display ch {0}: {1}", zeroBasedChannel + 1, text);
     }
 
+    public void SendIconDisplayColors(IReadOnlyList<StripColor> colors)
+    {
+        if (_midiOut == IntPtr.Zero)
+            return;
+
+        var payload = new byte[31];
+        payload[0] = 0xF0;
+        payload[1] = 0x00;
+        payload[2] = 0x02;
+        payload[3] = 0x4E;
+        payload[4] = 0x16;
+        payload[5] = 0x14;
+        for (var i = 0; i < 8; i++)
+        {
+            var color = i < colors.Count ? colors[i] : StripColor.Blue;
+            var (red, green, blue) = ToIconRgb127(color);
+            payload[6 + 3 * i] = red;
+            payload[6 + 3 * i + 1] = green;
+            payload[6 + 3 * i + 2] = blue;
+        }
+        payload[30] = 0xF7;
+
+        if (_lastDisplayColorPacket.SequenceEqual(payload))
+            return;
+
+        _lastDisplayColorPacket = payload.ToArray();
+        SendLong(payload);
+        _logger.Debug("Sent iCON display colors: {0}", string.Join(", ", colors.Take(8)));
+    }
+
     private void SendLong(byte[] data)
     {
         var dataPtr = IntPtr.Zero;
@@ -178,6 +209,25 @@ public sealed class MidiDeviceManager : IDisposable
         return Encoding.ASCII.GetBytes(text.Select(ch => ch is >= ' ' and <= '~' ? ch : '?').ToArray());
     }
 
+    private static (byte Red, byte Green, byte Blue) ToIconRgb127(StripColor color)
+    {
+        var (red, green, blue) = color switch
+        {
+            StripColor.Off => (0, 0, 0),
+            StripColor.White => (127, 127, 127),
+            StripColor.Red => (127, 0, 0),
+            StripColor.Orange => (127, 54, 0),
+            StripColor.Yellow => (127, 118, 0),
+            StripColor.Green => (0, 127, 0),
+            StripColor.Cyan => (0, 110, 127),
+            StripColor.Blue => (0, 36, 127),
+            StripColor.Purple => (74, 0, 127),
+            StripColor.Pink => (127, 0, 82),
+            _ => (0, 36, 127)
+        };
+        return ((byte)red, (byte)green, (byte)blue);
+    }
+
     public void Close()
     {
         if (_midiIn != IntPtr.Zero)
@@ -194,6 +244,7 @@ public sealed class MidiDeviceManager : IDisposable
             MidiInterop.midiOutClose(_midiOut);
             _midiOut = IntPtr.Zero;
             OpenOutputName = "";
+            _lastDisplayColorPacket = [];
             _logger.Info("Closed MIDI output");
         }
     }

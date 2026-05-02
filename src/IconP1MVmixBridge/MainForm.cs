@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Drawing;
 using System.Globalization;
 using System.Windows.Forms;
 
@@ -18,6 +19,8 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _httpPort = new();
     private readonly NumericUpDown _tcpPort = new();
     private readonly NumericUpDown _pollMs = new();
+    private readonly NumericUpDown _faderWriteMs = new();
+    private readonly NumericUpDown _motorHoldMs = new();
     private readonly CheckBox _motorFeedback = new();
     private readonly CheckBox _displayText = new();
     private readonly Label _statusLabel = new();
@@ -34,6 +37,10 @@ public sealed class MainForm : Form
     private bool _updatingGrid;
     private string _lastMidiMessage = "none";
     private readonly DateTime[] _lastFaderTouch = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
+    private readonly DateTime[] _lastVmixFaderSend = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
+    private readonly DateTime[] _suppressIncomingFaderUntil = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
+    private readonly double[] _lastSentFaderPercent = Enumerable.Repeat(double.NaN, 8).ToArray();
+    private readonly int[] _lastMotorFeedbackValue = Enumerable.Repeat(-1, 8).ToArray();
 
     public MainForm(FileLogger logger)
     {
@@ -65,7 +72,7 @@ public sealed class MainForm : Form
             RowCount = 5,
             Padding = new Padding(12)
         };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 86));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 126));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
@@ -76,7 +83,7 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             ColumnCount = 10,
-            RowCount = 2
+            RowCount = 3
         };
         for (var i = 0; i < 10; i++)
             settings.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 10f));
@@ -89,6 +96,8 @@ public sealed class MainForm : Form
         AddLabeled(settings, "Poll ms", _pollMs, 7, 0, 3);
         AddLabeled(settings, "MIDI Input", _midiInputCombo, 0, 1, 5);
         AddLabeled(settings, "MIDI Output", _midiOutputCombo, 5, 1, 5);
+        AddLabeled(settings, "Fader ms", _faderWriteMs, 0, 2, 2);
+        AddLabeled(settings, "Motor hold ms", _motorHoldMs, 2, 2, 3);
 
         _httpPort.Minimum = 1;
         _httpPort.Maximum = 65535;
@@ -97,6 +106,12 @@ public sealed class MainForm : Form
         _pollMs.Minimum = 100;
         _pollMs.Maximum = 5000;
         _pollMs.Increment = 50;
+        _faderWriteMs.Minimum = 25;
+        _faderWriteMs.Maximum = 500;
+        _faderWriteMs.Increment = 25;
+        _motorHoldMs.Minimum = 250;
+        _motorHoldMs.Maximum = 5000;
+        _motorHoldMs.Increment = 250;
         _midiInputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
         _midiOutputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
         _midiInputCombo.SelectedIndexChanged += (_, _) => SuggestMatchingMidiOutput();
@@ -187,6 +202,20 @@ public sealed class MainForm : Form
             _logger.Warn("Grid data error at row {0}, column {1}: {2}", e.RowIndex, e.ColumnIndex, e.Exception?.Message ?? "Unknown error");
             e.ThrowException = false;
         };
+        _grid.CellFormatting += (_, e) =>
+        {
+            if (e.RowIndex < 0 || _grid.Columns[e.ColumnIndex].Name != "StripColor")
+                return;
+
+            var colorName = e.Value?.ToString();
+            if (e.CellStyle is not null && Enum.TryParse<StripColor>(colorName, out var color))
+            {
+                e.CellStyle.BackColor = ToDrawingColor(color);
+                e.CellStyle.ForeColor = color is StripColor.Off or StripColor.Blue or StripColor.Purple or StripColor.Red
+                    ? Color.White
+                    : Color.Black;
+            }
+        };
         _grid.CurrentCellDirtyStateChanged += (_, _) =>
         {
             if (_grid.IsCurrentCellDirty)
@@ -219,7 +248,14 @@ public sealed class MainForm : Form
         {
             Name = "Label",
             HeaderText = "Label Override",
-            FillWeight = 140
+            FillWeight = 120
+        });
+        _grid.Columns.Add(new DataGridViewComboBoxColumn
+        {
+            Name = "StripColor",
+            HeaderText = "Strip Color",
+            DataSource = Enum.GetValues<StripColor>(),
+            FillWeight = 90
         });
         _grid.Columns.Add(new DataGridViewTextBoxColumn
         {
@@ -243,6 +279,8 @@ public sealed class MainForm : Form
         _httpPort.Value = _profile.VMixHttpPort;
         _tcpPort.Value = _profile.VMixTcpPort;
         _pollMs.Value = _profile.PollIntervalMs;
+        _faderWriteMs.Value = _profile.FaderWriteIntervalMs;
+        _motorHoldMs.Value = _profile.MotorFeedbackHoldMs;
         _motorFeedback.Checked = _profile.SendMotorFaderFeedback;
         _displayText.Checked = _profile.SendMackieScribbleStripText;
         PopulateGridRows();
@@ -257,7 +295,7 @@ public sealed class MainForm : Form
             UpdateInputColumnDataSource();
             foreach (var assignment in _profile.Channels)
             {
-                _grid.Rows.Add(assignment.Channel, assignment.Kind, assignment.InputKey, assignment.LabelOverride, "", "");
+                _grid.Rows.Add(assignment.Channel, assignment.Kind, assignment.InputKey ?? "", assignment.LabelOverride, assignment.StripColor, "", "");
             }
         }
         finally
@@ -481,8 +519,12 @@ public sealed class MainForm : Form
                 _midi.SendPitchBend(i, PercentToFourteenBit(i % 2 == 0 ? 75 : 25));
                 _midi.SendMackieMeter(i, 8);
             }
+            _midi.SendIconDisplayColors(Enum.GetValues<StripColor>()
+                .Where(color => color != StripColor.Off)
+                .Take(8)
+                .ToList());
             _logger.Info("Sent MIDI hardware test to output '{0}'", _midi.OpenOutputName);
-            UpdateStatus("Sent MIDI test: labels VMIX 1-8, alternating faders, meters");
+            UpdateStatus("Sent MIDI test: labels VMIX 1-8, colors, alternating faders, meters");
         }
         catch (Exception ex)
         {
@@ -544,6 +586,15 @@ public sealed class MainForm : Form
             new("", _state.Inputs.Count == 0 ? "No vMix inputs loaded" : "(none)")
         };
         choices.AddRange(_state.Inputs.Select(input => new InputChoice(input.Key, $"{input.Number}: {input.Title}")));
+        foreach (var savedKey in _profile.Channels
+            .Select(channel => channel.InputKey)
+            .Concat(_grid.Rows.Cast<DataGridViewRow>().Select(row => row.Cells["InputKey"].Value?.ToString()))
+            .Where(key => !string.IsNullOrWhiteSpace(key))
+            .Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (!choices.Any(choice => choice.Key.Equals(savedKey, StringComparison.OrdinalIgnoreCase)))
+                choices.Add(new InputChoice(savedKey!, $"Missing input ({savedKey})"));
+        }
 
         if (_grid.Columns["InputKey"] is DataGridViewComboBoxColumn combo)
             combo.DataSource = choices;
@@ -552,6 +603,7 @@ public sealed class MainForm : Form
     private void UpdateLiveGridAndHardware()
     {
         var assignments = ReadAssignmentsFromGrid();
+        _midi.SendIconDisplayColors(assignments.Select(assignment => assignment.StripColor).ToList());
         for (var i = 0; i < assignments.Count; i++)
         {
             var assignment = assignments[i];
@@ -568,9 +620,15 @@ public sealed class MainForm : Form
 
             if (_profile.SendMotorFaderFeedback &&
                 live.VolumePercent.HasValue &&
-                DateTime.Now - _lastFaderTouch[i] > TimeSpan.FromMilliseconds(750))
+                DateTime.Now - _lastFaderTouch[i] > TimeSpan.FromMilliseconds(_profile.MotorFeedbackHoldMs))
             {
-                _midi.SendPitchBend(i, PercentToFourteenBit(live.VolumePercent.Value));
+                var feedbackValue = PercentToFourteenBit(live.VolumePercent.Value);
+                if (Math.Abs(feedbackValue - _lastMotorFeedbackValue[i]) > 8)
+                {
+                    _lastMotorFeedbackValue[i] = feedbackValue;
+                    _suppressIncomingFaderUntil[i] = DateTime.Now.AddMilliseconds(250);
+                    _midi.SendPitchBend(i, feedbackValue);
+                }
             }
 
             if (_profile.SendMackieScribbleStripText)
@@ -587,6 +645,8 @@ public sealed class MainForm : Form
         _profile.VMixHttpPort = (int)_httpPort.Value;
         _profile.VMixTcpPort = (int)_tcpPort.Value;
         _profile.PollIntervalMs = (int)_pollMs.Value;
+        _profile.FaderWriteIntervalMs = (int)_faderWriteMs.Value;
+        _profile.MotorFeedbackHoldMs = (int)_motorHoldMs.Value;
         _profile.MidiInputName = _midiInputCombo.Text.Trim();
         _profile.MidiOutputName = _midiOutputCombo.Text.Trim();
         _profile.SendMotorFaderFeedback = _motorFeedback.Checked;
@@ -610,13 +670,17 @@ public sealed class MainForm : Form
                 : Enum.TryParse<AssignmentKind>(row.Cells["Kind"].Value?.ToString(), out var parsed) ? parsed : AssignmentKind.None;
             var inputKey = row.Cells["InputKey"].Value?.ToString();
             var label = row.Cells["Label"].Value?.ToString() ?? "";
+            var color = row.Cells["StripColor"].Value is StripColor stripColor
+                ? stripColor
+                : Enum.TryParse<StripColor>(row.Cells["StripColor"].Value?.ToString(), out var parsedColor) ? parsedColor : StripColor.Blue;
             assignments.Add(new ChannelAssignment
             {
                 Channel = channel,
                 Kind = kind,
                 InputKey = inputKey,
                 LabelOverride = label,
-                FollowInputName = string.IsNullOrWhiteSpace(label)
+                FollowInputName = string.IsNullOrWhiteSpace(label),
+                StripColor = color
             });
         }
         return assignments;
@@ -675,10 +739,32 @@ public sealed class MainForm : Form
             {
                 var value14 = e.Data1 | (e.Data2 << 7);
                 var percent = value14 / 16383.0 * 100.0;
+                if (DateTime.Now < _suppressIncomingFaderUntil[e.Channel] &&
+                    Math.Abs(value14 - _lastMotorFeedbackValue[e.Channel]) <= 64)
+                {
+                    _logger.Debug("Suppressed motor-feedback echo ch {0}: {1:0.##}", e.Channel + 1, percent);
+                    return;
+                }
+
                 _lastFaderTouch[e.Channel] = DateTime.Now;
+                if (DateTime.Now - _lastVmixFaderSend[e.Channel] < TimeSpan.FromMilliseconds(_profile.FaderWriteIntervalMs) &&
+                    !double.IsNaN(_lastSentFaderPercent[e.Channel]) &&
+                    Math.Abs(percent - _lastSentFaderPercent[e.Channel]) < 1.5)
+                {
+                    _logger.Debug("Rate-limited MIDI fader ch {0}: {1:0.##}", e.Channel + 1, percent);
+                    return;
+                }
+
+                _lastVmixFaderSend[e.Channel] = DateTime.Now;
+                _lastSentFaderPercent[e.Channel] = percent;
                 _logger.Debug("MIDI fader ch {0}: {1:0.##}", e.Channel + 1, percent);
                 await _vmix.SetAssignmentVolumeAsync(assignments[e.Channel], percent, _pollCts.Token);
-                BeginInvoke(new MethodInvoker(() => UpdateStatus()));
+                BeginInvoke(new MethodInvoker(() =>
+                {
+                    if (e.Channel < _grid.Rows.Count)
+                        _grid.Rows[e.Channel].Cells["LiveVolume"].Value = percent.ToString("0", CultureInfo.InvariantCulture);
+                    UpdateStatus();
+                }));
             }
             else if (e.Command == 0x90 && e.Data2 > 0 && e.Data1 is >= 16 and <= 23)
             {
@@ -700,6 +786,21 @@ public sealed class MainForm : Form
     }
 
     private static int PercentToFourteenBit(double percent) => (int)Math.Round(Math.Clamp(percent, 0, 100) / 100.0 * 16383);
+
+    private static Color ToDrawingColor(StripColor color) => color switch
+    {
+        StripColor.Off => Color.Black,
+        StripColor.White => Color.White,
+        StripColor.Red => Color.Firebrick,
+        StripColor.Orange => Color.Orange,
+        StripColor.Yellow => Color.Gold,
+        StripColor.Green => Color.ForestGreen,
+        StripColor.Cyan => Color.DarkTurquoise,
+        StripColor.Blue => Color.RoyalBlue,
+        StripColor.Purple => Color.MediumPurple,
+        StripColor.Pink => Color.HotPink,
+        _ => Color.RoyalBlue
+    };
 
     private static double XmlVolumeToFaderPercent(double xmlVolume)
     {
