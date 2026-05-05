@@ -8,8 +8,8 @@ public sealed class BridgeProfile
     public string VMixHost { get; set; } = "127.0.0.1";
     public int VMixHttpPort { get; set; } = 8088;
     public int VMixTcpPort { get; set; } = 8099;
-    public int PollIntervalMs { get; set; } = 250;
-    public int FaderWriteIntervalMs { get; set; } = 75;
+    public int PollIntervalMs { get; set; } = 100;
+    public int FaderWriteIntervalMs { get; set; } = 15;
     public int MotorFeedbackHoldMs { get; set; } = 1800;
     public string MidiInputName { get; set; } = "";
     public string MidiOutputName { get; set; } = "";
@@ -55,8 +55,8 @@ public sealed class BridgeProfile
     {
         VMixHttpPort = Math.Clamp(VMixHttpPort, 1, 65535);
         VMixTcpPort = Math.Clamp(VMixTcpPort, 1, 65535);
-        PollIntervalMs = Math.Clamp(PollIntervalMs, 100, 5000);
-        FaderWriteIntervalMs = Math.Clamp(FaderWriteIntervalMs, 25, 500);
+        PollIntervalMs = Math.Clamp(PollIntervalMs, 50, 5000);
+        FaderWriteIntervalMs = Math.Clamp(FaderWriteIntervalMs, 10, 500);
         MotorFeedbackHoldMs = Math.Clamp(MotorFeedbackHoldMs, 250, 5000);
 
         var byChannel = Channels

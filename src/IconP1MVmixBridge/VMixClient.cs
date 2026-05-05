@@ -79,6 +79,39 @@ public sealed class VMixClient : IDisposable
         await SendTcpCommandAsync(command, cancellationToken).ConfigureAwait(false);
     }
 
+    public async Task SetAssignmentVolumeFastAsync(ChannelAssignment assignment, double volumePercent, CancellationToken cancellationToken)
+    {
+        volumePercent = Math.Clamp(volumePercent, 0, 100);
+        var value = volumePercent.ToString("0.##", CultureInfo.InvariantCulture);
+        var function = assignment.Kind switch
+        {
+            AssignmentKind.Input when !string.IsNullOrWhiteSpace(assignment.InputKey) => "SetVolume",
+            AssignmentKind.Master => "SetMasterVolume",
+            AssignmentKind.BusA => "SetBusAVolume",
+            AssignmentKind.BusB => "SetBusBVolume",
+            AssignmentKind.BusC => "SetBusCVolume",
+            AssignmentKind.BusD => "SetBusDVolume",
+            AssignmentKind.BusE => "SetBusEVolume",
+            AssignmentKind.BusF => "SetBusFVolume",
+            AssignmentKind.BusG => "SetBusGVolume",
+            _ => ""
+        };
+
+        if (string.IsNullOrWhiteSpace(function))
+            return;
+
+        var builder = new UriBuilder("http", _host, _httpPort, "api/")
+        {
+            Query = assignment.Kind == AssignmentKind.Input
+                ? $"Function={function}&Input={UrlEncode(assignment.InputKey!)}&Value={value}"
+                : $"Function={function}&Value={value}"
+        };
+
+        using var response = await _httpClient.GetAsync(builder.Uri, cancellationToken).ConfigureAwait(false);
+        if (!response.IsSuccessStatusCode)
+            _logger.Warn("vMix HTTP fader command failed: {0} {1}", (int)response.StatusCode, response.ReasonPhrase);
+    }
+
     public async Task ToggleMuteAsync(ChannelAssignment assignment, CancellationToken cancellationToken)
     {
         var command = assignment.Kind switch

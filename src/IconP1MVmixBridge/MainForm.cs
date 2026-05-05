@@ -12,6 +12,7 @@ public sealed class MainForm : Form
     private readonly VMixClient _vmix;
     private readonly MidiDeviceManager _midi;
     private readonly System.Windows.Forms.Timer _pollTimer = new();
+    private readonly System.Windows.Forms.Timer _faderSendTimer = new();
     private readonly DataGridView _grid = new();
     private readonly ComboBox _midiInputCombo = new();
     private readonly ComboBox _midiOutputCombo = new();
@@ -41,6 +42,9 @@ public sealed class MainForm : Form
     private readonly DateTime[] _suppressIncomingFaderUntil = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
     private readonly double[] _lastSentFaderPercent = Enumerable.Repeat(double.NaN, 8).ToArray();
     private readonly int[] _lastMotorFeedbackValue = Enumerable.Repeat(-1, 8).ToArray();
+    private readonly double[] _pendingFaderPercent = Enumerable.Repeat(double.NaN, 8).ToArray();
+    private readonly bool[] _pendingFaderDirty = new bool[8];
+    private readonly bool[] _faderSendInFlight = new bool[8];
 
     public MainForm(FileLogger logger)
     {
@@ -103,12 +107,12 @@ public sealed class MainForm : Form
         _httpPort.Maximum = 65535;
         _tcpPort.Minimum = 1;
         _tcpPort.Maximum = 65535;
-        _pollMs.Minimum = 100;
+        _pollMs.Minimum = 50;
         _pollMs.Maximum = 5000;
         _pollMs.Increment = 50;
-        _faderWriteMs.Minimum = 25;
+        _faderWriteMs.Minimum = 10;
         _faderWriteMs.Maximum = 500;
-        _faderWriteMs.Increment = 25;
+        _faderWriteMs.Increment = 5;
         _motorHoldMs.Minimum = 250;
         _motorHoldMs.Maximum = 5000;
         _motorHoldMs.Increment = 250;
@@ -412,6 +416,8 @@ public sealed class MainForm : Form
     {
         _pollTimer.Interval = (int)_pollMs.Value;
         _pollTimer.Tick += async (_, _) => await PollOnceAsync();
+        _faderSendTimer.Interval = (int)_faderWriteMs.Value;
+        _faderSendTimer.Tick += (_, _) => FlushPendingFaders();
     }
 
     protected override async void OnShown(EventArgs e)
@@ -440,7 +446,9 @@ public sealed class MainForm : Form
                 throw new InvalidOperationException($"MIDI did not fully open. Input open: {_midi.InputOpen}. Output open: {_midi.OutputOpen}. Check selected P1-M ports.");
             _pollCts = new CancellationTokenSource();
             _pollTimer.Interval = _profile.PollIntervalMs;
+            _faderSendTimer.Interval = _profile.FaderWriteIntervalMs;
             _pollTimer.Start();
+            _faderSendTimer.Start();
             _connected = true;
             _connectButton.Enabled = false;
             _stopBridgeButton.Enabled = true;
@@ -460,6 +468,7 @@ public sealed class MainForm : Form
     private void Disconnect()
     {
         _pollTimer.Stop();
+        _faderSendTimer.Stop();
         _pollCts?.Cancel();
         _pollCts?.Dispose();
         _pollCts = null;
@@ -540,6 +549,50 @@ public sealed class MainForm : Form
             return;
 
         await RefreshVmixStateAsync(_pollCts.Token);
+    }
+
+    private void FlushPendingFaders()
+    {
+        if (!_connected || _pollCts?.IsCancellationRequested != false)
+            return;
+
+        var assignments = ReadAssignmentsFromGrid();
+        for (var channel = 0; channel < 8 && channel < assignments.Count; channel++)
+        {
+            if (!_pendingFaderDirty[channel] || _faderSendInFlight[channel])
+                continue;
+
+            var percent = _pendingFaderPercent[channel];
+            if (double.IsNaN(percent))
+                continue;
+
+            _pendingFaderDirty[channel] = false;
+            _lastVmixFaderSend[channel] = DateTime.Now;
+            _lastSentFaderPercent[channel] = percent;
+            _faderSendInFlight[channel] = true;
+            _ = SendFaderUpdateAsync(channel, assignments[channel], percent);
+        }
+    }
+
+    private async Task SendFaderUpdateAsync(int channel, ChannelAssignment assignment, double percent)
+    {
+        try
+        {
+            await _vmix.SetAssignmentVolumeFastAsync(assignment, percent, _pollCts?.Token ?? CancellationToken.None);
+        }
+        catch (OperationCanceledException)
+        {
+            // Shutdown path.
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Fast vMix fader update failed for channel {0}", channel + 1);
+            BeginInvoke(new MethodInvoker(() => UpdateStatus($"Fader send failed: {ex.Message}")));
+        }
+        finally
+        {
+            _faderSendInFlight[channel] = false;
+        }
     }
 
     private async Task RefreshVmixInputsAsync()
@@ -635,7 +688,7 @@ public sealed class MainForm : Form
                 _midi.SendMackieScribbleText(i, live.Label);
 
             if (live.MeterPercent.HasValue)
-                _midi.SendMackieMeter(i, (int)Math.Round(live.MeterPercent.Value / 100.0 * 12));
+                _midi.SendMackieMeter(i, MeterPercentToMackieLevel(live.MeterPercent.Value));
         }
     }
 
@@ -694,7 +747,7 @@ public sealed class MainForm : Form
             if (input is not null)
             {
                 var label = string.IsNullOrWhiteSpace(assignment.LabelOverride) ? input.Title : assignment.LabelOverride;
-                return new LiveChannel(label, XmlVolumeToFaderPercent(input.Volume), Math.Max(input.MeterF1, input.MeterF2) * 100);
+                return new LiveChannel(label, XmlVolumeToFaderPercent(input.Volume), VmixMeterToDisplayPercent(Math.Max(input.MeterF1, input.MeterF2)));
             }
         }
 
@@ -747,18 +800,15 @@ public sealed class MainForm : Form
                 }
 
                 _lastFaderTouch[e.Channel] = DateTime.Now;
-                if (DateTime.Now - _lastVmixFaderSend[e.Channel] < TimeSpan.FromMilliseconds(_profile.FaderWriteIntervalMs) &&
-                    !double.IsNaN(_lastSentFaderPercent[e.Channel]) &&
-                    Math.Abs(percent - _lastSentFaderPercent[e.Channel]) < 1.5)
+                if (!double.IsNaN(_lastSentFaderPercent[e.Channel]) &&
+                    Math.Abs(percent - _lastSentFaderPercent[e.Channel]) < 0.2)
                 {
-                    _logger.Debug("Rate-limited MIDI fader ch {0}: {1:0.##}", e.Channel + 1, percent);
                     return;
                 }
 
-                _lastVmixFaderSend[e.Channel] = DateTime.Now;
-                _lastSentFaderPercent[e.Channel] = percent;
+                _pendingFaderPercent[e.Channel] = percent;
+                _pendingFaderDirty[e.Channel] = true;
                 _logger.Debug("MIDI fader ch {0}: {1:0.##}", e.Channel + 1, percent);
-                await _vmix.SetAssignmentVolumeAsync(assignments[e.Channel], percent, _pollCts.Token);
                 BeginInvoke(new MethodInvoker(() =>
                 {
                     if (e.Channel < _grid.Rows.Count)
@@ -786,6 +836,24 @@ public sealed class MainForm : Form
     }
 
     private static int PercentToFourteenBit(double percent) => (int)Math.Round(Math.Clamp(percent, 0, 100) / 100.0 * 16383);
+
+    private static double VmixMeterToDisplayPercent(double rawMeter)
+    {
+        var normalized = rawMeter > 1.0 ? rawMeter / 100.0 : rawMeter;
+        normalized = Math.Clamp(normalized, 0.0, 1.0);
+        if (normalized <= 0.00001)
+            return 0;
+
+        var db = 20.0 * Math.Log10(normalized);
+        return Math.Clamp((db + 60.0) / 54.0 * 100.0, 0.0, 100.0);
+    }
+
+    private static int MeterPercentToMackieLevel(double meterPercent)
+    {
+        if (meterPercent <= 0)
+            return 0;
+        return (int)Math.Clamp(Math.Round(meterPercent / 100.0 * 12.0), 1, 12);
+    }
 
     private static Color ToDrawingColor(StripColor color) => color switch
     {
