@@ -82,7 +82,7 @@ public sealed class VMixClient : IDisposable
     public async Task SetAssignmentVolumeFastAsync(ChannelAssignment assignment, double volumePercent, CancellationToken cancellationToken)
     {
         volumePercent = Math.Clamp(volumePercent, 0, 100);
-        var value = volumePercent.ToString("0.##", CultureInfo.InvariantCulture);
+        var value = ((int)Math.Round(volumePercent)).ToString(CultureInfo.InvariantCulture);
         var function = assignment.Kind switch
         {
             AssignmentKind.Input when !string.IsNullOrWhiteSpace(assignment.InputKey) => "SetVolume",
@@ -100,16 +100,23 @@ public sealed class VMixClient : IDisposable
         if (string.IsNullOrWhiteSpace(function))
             return;
 
-        var builder = new UriBuilder("http", _host, _httpPort, "api/")
-        {
-            Query = assignment.Kind == AssignmentKind.Input
-                ? $"Function={function}&Input={UrlEncode(assignment.InputKey!)}&Value={value}"
-                : $"Function={function}&Value={value}"
-        };
+        var query = assignment.Kind == AssignmentKind.Input
+            ? $"Function={function}&Input={UrlEncode(assignment.InputKey!)}&Value={value}"
+            : $"Function={function}&Value={value}";
+        var uri = new Uri($"http://{_host}:{_httpPort}/api/?{query}");
 
-        using var response = await _httpClient.GetAsync(builder.Uri, cancellationToken).ConfigureAwait(false);
+        using var response = await _httpClient.GetAsync(uri, cancellationToken).ConfigureAwait(false);
         if (!response.IsSuccessStatusCode)
-            _logger.Warn("vMix HTTP fader command failed: {0} {1}", (int)response.StatusCode, response.ReasonPhrase);
+        {
+            var body = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+            _logger.Warn("vMix HTTP fader command failed: {0} {1}. Function={2}, Input={3}, Value={4}. Body={5}",
+                (int)response.StatusCode,
+                response.ReasonPhrase,
+                function,
+                assignment.InputKey ?? "",
+                value,
+                body);
+        }
     }
 
     public async Task ToggleMuteAsync(ChannelAssignment assignment, CancellationToken cancellationToken)

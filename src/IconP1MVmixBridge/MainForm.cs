@@ -45,6 +45,7 @@ public sealed class MainForm : Form
     private readonly double[] _pendingFaderPercent = Enumerable.Repeat(double.NaN, 8).ToArray();
     private readonly bool[] _pendingFaderDirty = new bool[8];
     private readonly bool[] _faderSendInFlight = new bool[8];
+    private readonly string[] _lastStripLabels = Enumerable.Repeat("", 8).ToArray();
 
     public MainForm(FileLogger logger)
     {
@@ -200,10 +201,27 @@ public sealed class MainForm : Form
         _grid.RowHeadersVisible = false;
         _grid.AutoSizeColumnsMode = DataGridViewAutoSizeColumnsMode.Fill;
         _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
-        _grid.CellValueChanged += (_, _) => { if (!_updatingGrid) SaveProfile(); };
+        _grid.CellValueChanged += (_, e) =>
+        {
+            if (_updatingGrid || e.RowIndex < 0 || e.ColumnIndex < 0)
+                return;
+
+            var columnName = _grid.Columns[e.ColumnIndex].Name;
+            if (columnName is "LiveVolume" or "Meter")
+                return;
+
+            SaveProfile();
+        };
         _grid.DataError += (_, e) =>
         {
             _logger.Warn("Grid data error at row {0}, column {1}: {2}", e.RowIndex, e.ColumnIndex, e.Exception?.Message ?? "Unknown error");
+            if (e.RowIndex >= 0 &&
+                e.ColumnIndex >= 0 &&
+                _grid.Columns[e.ColumnIndex].Name == "StripColor" &&
+                e.RowIndex < _grid.Rows.Count)
+            {
+                SetGridCellValue(e.RowIndex, "StripColor", StripColor.Blue);
+            }
             e.ThrowException = false;
         };
         _grid.CellFormatting += (_, e) =>
@@ -299,7 +317,7 @@ public sealed class MainForm : Form
             UpdateInputColumnDataSource();
             foreach (var assignment in _profile.Channels)
             {
-                _grid.Rows.Add(assignment.Channel, assignment.Kind, assignment.InputKey ?? "", assignment.LabelOverride, assignment.StripColor, "", "");
+                _grid.Rows.Add(assignment.Channel, assignment.Kind, assignment.InputKey ?? "", assignment.LabelOverride, NormalizeStripColor(assignment.StripColor), "", "");
             }
         }
         finally
@@ -473,6 +491,7 @@ public sealed class MainForm : Form
         _pollCts?.Dispose();
         _pollCts = null;
         _midi.Close();
+        ResetHardwareFeedbackCache();
         _connected = false;
         _connectButton.Enabled = true;
         _stopBridgeButton.Enabled = false;
@@ -499,6 +518,7 @@ public sealed class MainForm : Form
                 throw new InvalidOperationException("The selected MIDI output is Microsoft GS Wavetable Synth. Select the iCON P1-M output port instead.");
 
             _midi.Open(_profile.MidiInputName, _profile.MidiOutputName);
+            ResetHardwareFeedbackCache();
             _openMidiButton.Text = "Close MIDI";
             _logger.Info("MIDI opened from UI. Input open: {0}, output open: {1}", _midi.InputOpen, _midi.OutputOpen);
             UpdateStatus();
@@ -532,6 +552,7 @@ public sealed class MainForm : Form
                 .Where(color => color != StripColor.Off)
                 .Take(8)
                 .ToList());
+            ResetHardwareFeedbackCache();
             _logger.Info("Sent MIDI hardware test to output '{0}'", _midi.OpenOutputName);
             UpdateStatus("Sent MIDI test: labels VMIX 1-8, colors, alternating faders, meters");
         }
@@ -663,12 +684,12 @@ public sealed class MainForm : Form
             var live = ResolveLiveChannel(assignment);
             if (i < _grid.Rows.Count)
             {
-                _grid.Rows[i].Cells["LiveVolume"].Value = live.VolumePercent.HasValue
+                SetGridCellValue(i, "LiveVolume", live.VolumePercent.HasValue
                     ? live.VolumePercent.Value.ToString("0", CultureInfo.InvariantCulture)
-                    : "";
-                _grid.Rows[i].Cells["Meter"].Value = live.MeterPercent.HasValue
+                    : "");
+                SetGridCellValue(i, "Meter", live.MeterPercent.HasValue
                     ? live.MeterPercent.Value.ToString("0", CultureInfo.InvariantCulture)
-                    : "";
+                    : "");
             }
 
             if (_profile.SendMotorFaderFeedback &&
@@ -684,11 +705,35 @@ public sealed class MainForm : Form
                 }
             }
 
-            if (_profile.SendMackieScribbleStripText)
+            if (_profile.SendMackieScribbleStripText && !string.Equals(_lastStripLabels[i], live.Label, StringComparison.Ordinal))
+            {
+                _lastStripLabels[i] = live.Label;
                 _midi.SendMackieScribbleText(i, live.Label);
+            }
 
             if (live.MeterPercent.HasValue)
                 _midi.SendMackieMeter(i, MeterPercentToMackieLevel(live.MeterPercent.Value));
+        }
+    }
+
+    private void SetGridCellValue(int rowIndex, string columnName, object value)
+    {
+        if (rowIndex < 0 || rowIndex >= _grid.Rows.Count)
+            return;
+
+        var cell = _grid.Rows[rowIndex].Cells[columnName];
+        if (Equals(cell.Value, value))
+            return;
+
+        var wasUpdating = _updatingGrid;
+        _updatingGrid = true;
+        try
+        {
+            cell.Value = value;
+        }
+        finally
+        {
+            _updatingGrid = wasUpdating;
         }
     }
 
@@ -726,6 +771,7 @@ public sealed class MainForm : Form
             var color = row.Cells["StripColor"].Value is StripColor stripColor
                 ? stripColor
                 : Enum.TryParse<StripColor>(row.Cells["StripColor"].Value?.ToString(), out var parsedColor) ? parsedColor : StripColor.Blue;
+            color = NormalizeStripColor(color);
             assignments.Add(new ChannelAssignment
             {
                 Channel = channel,
@@ -775,11 +821,17 @@ public sealed class MainForm : Form
 
     private async void OnMidiMessageReceived(object? sender, MidiMessageEventArgs e)
     {
+        if (InvokeRequired)
+        {
+            BeginInvoke(new MethodInvoker(() => OnMidiMessageReceived(sender, e)));
+            return;
+        }
+
         if (!_connected || _pollCts?.IsCancellationRequested != false)
         {
             _lastMidiMessage = $"ignored {e.Status:X2} {e.Data1:X2} {e.Data2:X2}";
             _logger.Debug("MIDI ignored while bridge stopped: status {0:X2}, data1 {1:X2}, data2 {2:X2}, channel {3}", e.Status, e.Data1, e.Data2, e.Channel + 1);
-            BeginInvoke(new MethodInvoker(() => UpdateStatus()));
+            UpdateStatus();
             return;
         }
 
@@ -809,33 +861,37 @@ public sealed class MainForm : Form
                 _pendingFaderPercent[e.Channel] = percent;
                 _pendingFaderDirty[e.Channel] = true;
                 _logger.Debug("MIDI fader ch {0}: {1:0.##}", e.Channel + 1, percent);
-                BeginInvoke(new MethodInvoker(() =>
-                {
-                    if (e.Channel < _grid.Rows.Count)
-                        _grid.Rows[e.Channel].Cells["LiveVolume"].Value = percent.ToString("0", CultureInfo.InvariantCulture);
-                    UpdateStatus();
-                }));
+                SetGridCellValue(e.Channel, "LiveVolume", percent.ToString("0", CultureInfo.InvariantCulture));
+                UpdateStatus();
             }
             else if (e.Command == 0x90 && e.Data2 > 0 && e.Data1 is >= 16 and <= 23)
             {
                 var channel = e.Data1 - 16;
                 _logger.Debug("MIDI mute button ch {0}", channel + 1);
                 await _vmix.ToggleMuteAsync(assignments[channel], _pollCts.Token);
-                BeginInvoke(new MethodInvoker(() => UpdateStatus()));
+                UpdateStatus();
             }
             else
             {
-                BeginInvoke(new MethodInvoker(() => UpdateStatus("MIDI received, but not mapped to a fader/mute action")));
+                UpdateStatus("MIDI received, but not mapped to a fader/mute action");
             }
         }
         catch (Exception ex)
         {
             _logger.Error(ex, "MIDI action failed. Raw message {0:X6}", e.RawMessage);
-            BeginInvoke(new MethodInvoker(() => UpdateStatus($"MIDI action failed: {ex.Message}")));
+            UpdateStatus($"MIDI action failed: {ex.Message}");
         }
     }
 
     private static int PercentToFourteenBit(double percent) => (int)Math.Round(Math.Clamp(percent, 0, 100) / 100.0 * 16383);
+
+    private void ResetHardwareFeedbackCache()
+    {
+        Array.Fill(_lastStripLabels, "");
+        Array.Fill(_lastMotorFeedbackValue, -1);
+    }
+
+    private static StripColor NormalizeStripColor(StripColor color) => Enum.IsDefined(color) ? color : StripColor.Blue;
 
     private static double VmixMeterToDisplayPercent(double rawMeter)
     {
