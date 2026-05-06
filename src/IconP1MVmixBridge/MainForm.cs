@@ -51,6 +51,7 @@ public sealed class MainForm : Form
     private readonly string[] _lastStripLabels = Enumerable.Repeat("", 8).ToArray();
     private readonly bool[] _faderTouched = new bool[8];
     private readonly DateTime[] _blockMotorFeedbackUntil = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
+    private readonly DateTime[] _ignoreLocalFaderUntil = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
     private readonly NotifyIcon _trayIcon = new();
     private bool _allowExit;
     private bool _gridEditing;
@@ -771,7 +772,11 @@ public sealed class MainForm : Form
                 {
                     _lastMotorFeedbackValue[i] = feedbackValue;
                     _suppressIncomingFaderUntil[i] = DateTime.Now.AddMilliseconds(1000);
-                    _logger.Debug("Motor feedback ch {0}: {1:0.##}", i + 1, live.VolumePercent.Value);
+                    _logger.Debug("Motor feedback ch {0}: {1:0.##}% raw {2}; suppress incoming until {3:HH:mm:ss.fff}",
+                        i + 1,
+                        live.VolumePercent.Value,
+                        feedbackValue,
+                        _suppressIncomingFaderUntil[i]);
                     _midi.SendPitchBend(i, feedbackValue);
                 }
             }
@@ -943,17 +948,51 @@ public sealed class MainForm : Form
             if (e.Command == 0x90 && e.Data1 is >= 0x68 and <= 0x6F)
             {
                 var channel = e.Data1 - 0x68;
-                if (DateTime.Now < _suppressIncomingFaderUntil[channel])
+                var now = DateTime.Now;
+                var touched = e.Data2 > 0;
+                if (now < _suppressIncomingFaderUntil[channel])
                 {
                     _faderTouched[channel] = false;
-                    _logger.Debug("Ignored motor fader touch echo ch {0}: {1}", channel + 1, e.Data2 > 0 ? "on" : "off");
+                    _logger.Debug("Ignored motor fader touch echo ch {0}: {1}; suppress remaining {2:0} ms",
+                        channel + 1,
+                        touched ? "on" : "off",
+                        (_suppressIncomingFaderUntil[channel] - now).TotalMilliseconds);
                     return;
                 }
 
-                _faderTouched[channel] = e.Data2 > 0;
-                _lastFaderTouch[channel] = DateTime.Now;
-                if (!_faderTouched[channel])
-                    _blockMotorFeedbackUntil[channel] = DateTime.Now.AddSeconds(10);
+                if (now < _ignoreLocalFaderUntil[channel])
+                {
+                    _faderTouched[channel] = false;
+                    _logger.Debug("Ignored post-release fader touch ch {0}: {1}; ignore remaining {2:0} ms",
+                        channel + 1,
+                        touched ? "on" : "off",
+                        (_ignoreLocalFaderUntil[channel] - now).TotalMilliseconds);
+                    return;
+                }
+
+                _faderTouched[channel] = touched;
+                _lastFaderTouch[channel] = now;
+                if (!touched)
+                {
+                    _blockMotorFeedbackUntil[channel] = now.AddSeconds(10);
+                    _ignoreLocalFaderUntil[channel] = now.AddSeconds(3);
+
+                    if (_lastMotorFeedbackValue[channel] >= 0)
+                    {
+                        _suppressIncomingFaderUntil[channel] = now.AddSeconds(3);
+                        _logger.Debug("MIDI fader release hold ch {0}: raw {1}, {2:0.##}%; suppress/ignore until {3:HH:mm:ss.fff}; output open: {4}",
+                            channel + 1,
+                            _lastMotorFeedbackValue[channel],
+                            _lastMotorFeedbackValue[channel] / 16383.0 * 100.0,
+                            _suppressIncomingFaderUntil[channel],
+                            _midi.OutputOpen);
+                        _midi.SendPitchBend(channel, _lastMotorFeedbackValue[channel]);
+                    }
+                    else
+                    {
+                        _logger.Debug("MIDI fader release hold ch {0}: skipped because no current fader value is known", channel + 1);
+                    }
+                }
 
                 _logger.Debug("MIDI fader touch ch {0}: {1}", channel + 1, _faderTouched[channel] ? "on" : "off");
                 UpdateStatus();
@@ -965,30 +1004,54 @@ public sealed class MainForm : Form
             {
                 var value14 = e.Data1 | (e.Data2 << 7);
                 var percent = value14 / 16383.0 * 100.0;
+                var now = DateTime.Now;
+                if (now < _ignoreLocalFaderUntil[e.Channel])
+                {
+                    _logger.Debug("Ignored post-release fader movement ch {0}: {1:0.##}% raw {2}; ignore remaining {3:0} ms",
+                        e.Channel + 1,
+                        percent,
+                        value14,
+                        (_ignoreLocalFaderUntil[e.Channel] - now).TotalMilliseconds);
+                    return;
+                }
+
+                if (now < _suppressIncomingFaderUntil[e.Channel])
+                {
+                    _logger.Debug("Suppressed motor-feedback echo ch {0}: {1:0.##}% raw {2}; suppress remaining {3:0} ms",
+                        e.Channel + 1,
+                        percent,
+                        value14,
+                        (_suppressIncomingFaderUntil[e.Channel] - now).TotalMilliseconds);
+                    return;
+                }
+
                 if (_profile.InputFadersAreTouchSensitive && !_faderTouched[e.Channel])
                 {
-                    _logger.Debug("Ignored untouched fader ch {0}: {1:0.##}", e.Channel + 1, percent);
+                    _logger.Debug("Ignored untouched fader ch {0}: {1:0.##}% raw {2}", e.Channel + 1, percent, value14);
                     return;
                 }
 
-                if (DateTime.Now < _suppressIncomingFaderUntil[e.Channel])
-                {
-                    _logger.Debug("Suppressed motor-feedback echo ch {0}: {1:0.##}", e.Channel + 1, percent);
-                    return;
-                }
-
-                _lastFaderTouch[e.Channel] = DateTime.Now;
-                _blockMotorFeedbackUntil[e.Channel] = DateTime.Now.AddSeconds(10);
+                _lastFaderTouch[e.Channel] = now;
+                _blockMotorFeedbackUntil[e.Channel] = now.AddSeconds(10);
                 _lastMotorFeedbackValue[e.Channel] = value14;
                 if (!double.IsNaN(_lastSentFaderPercent[e.Channel]) &&
                     Math.Abs(percent - _lastSentFaderPercent[e.Channel]) < 0.2)
                 {
+                    _logger.Debug("Ignored duplicate fader ch {0}: {1:0.##}% raw {2}; last sent {3:0.##}%",
+                        e.Channel + 1,
+                        percent,
+                        value14,
+                        _lastSentFaderPercent[e.Channel]);
                     return;
                 }
 
                 _pendingFaderPercent[e.Channel] = percent;
                 _pendingFaderDirty[e.Channel] = true;
-                _logger.Debug("MIDI fader ch {0}: {1:0.##}", e.Channel + 1, percent);
+                _logger.Debug("MIDI fader ch {0}: {1:0.##}% raw {2}; motor block until {3:HH:mm:ss.fff}",
+                    e.Channel + 1,
+                    percent,
+                    value14,
+                    _blockMotorFeedbackUntil[e.Channel]);
                 SetGridCellValue(e.Channel, "LiveVolume", percent.ToString("0", CultureInfo.InvariantCulture));
                 UpdateStatus();
             }
@@ -1019,6 +1082,7 @@ public sealed class MainForm : Form
         Array.Fill(_lastMotorFeedbackValue, -1);
         Array.Fill(_faderTouched, false);
         Array.Fill(_blockMotorFeedbackUntil, DateTime.MinValue);
+        Array.Fill(_ignoreLocalFaderUntil, DateTime.MinValue);
     }
 
     private static StripColor NormalizeStripColor(StripColor color) => Enum.IsDefined(color) ? color : StripColor.Blue;
