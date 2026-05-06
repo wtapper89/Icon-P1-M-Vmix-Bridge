@@ -117,6 +117,10 @@ public sealed class VMixClient : IDisposable
                 value,
                 body);
         }
+        else
+        {
+            _logger.Debug("vMix HTTP fader command sent. Function={0}, Input={1}, Value={2}", function, assignment.InputKey ?? "", value);
+        }
     }
 
     public async Task ToggleMuteAsync(ChannelAssignment assignment, CancellationToken cancellationToken)

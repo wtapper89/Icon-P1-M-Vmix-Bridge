@@ -16,6 +16,8 @@ public sealed class BridgeProfile
     public bool SendMackieScribbleStripText { get; set; } = true;
     public bool SendMotorFaderFeedback { get; set; } = true;
     public bool InputFadersAreTouchSensitive { get; set; } = true;
+    public bool MinimizeToTray { get; set; } = true;
+    public bool StartWithWindows { get; set; }
     public List<ChannelAssignment> Channels { get; set; } = Enumerable.Range(1, 8)
         .Select(index => new ChannelAssignment { Channel = index })
         .ToList();

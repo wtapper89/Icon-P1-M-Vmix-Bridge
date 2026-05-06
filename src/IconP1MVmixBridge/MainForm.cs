@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Drawing;
 using System.Globalization;
+using Microsoft.Win32;
 using System.Windows.Forms;
 
 namespace IconP1MVmixBridge;
@@ -24,6 +25,8 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _motorHoldMs = new();
     private readonly CheckBox _motorFeedback = new();
     private readonly CheckBox _displayText = new();
+    private readonly CheckBox _minimizeToTray = new();
+    private readonly CheckBox _startWithWindows = new();
     private readonly Label _statusLabel = new();
     private readonly Label _logLabel = new();
     private readonly Button _connectButton = new();
@@ -47,6 +50,11 @@ public sealed class MainForm : Form
     private readonly bool[] _faderSendInFlight = new bool[8];
     private readonly string[] _lastStripLabels = Enumerable.Repeat("", 8).ToArray();
     private readonly bool[] _faderTouched = new bool[8];
+    private readonly DateTime[] _blockMotorFeedbackUntil = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
+    private readonly NotifyIcon _trayIcon = new();
+    private bool _allowExit;
+    private bool _gridEditing;
+    private string _lastInputChoicesSignature = "";
 
     public MainForm(FileLogger logger)
     {
@@ -79,7 +87,7 @@ public sealed class MainForm : Form
             Padding = new Padding(12)
         };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 126));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 72));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 44));
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 32));
@@ -126,6 +134,8 @@ public sealed class MainForm : Form
         _motorFeedback.Checked = true;
         _displayText.Text = "Display text feedback";
         _displayText.Checked = true;
+        _minimizeToTray.Text = "Minimize to tray";
+        _startWithWindows.Text = "Start with Windows";
         _connectButton.Text = "Start Bridge";
         _connectButton.Click += (_, _) => ToggleConnection();
         _stopBridgeButton.Text = "Stop Bridge";
@@ -146,7 +156,7 @@ public sealed class MainForm : Form
         {
             Dock = DockStyle.Fill,
             FlowDirection = FlowDirection.LeftToRight,
-            WrapContents = false,
+            WrapContents = true,
             Padding = new Padding(0, 6, 0, 4)
         };
         commandBar.Controls.Add(refreshMidi);
@@ -158,9 +168,11 @@ public sealed class MainForm : Form
         commandBar.Controls.Add(_stopBridgeButton);
         commandBar.Controls.Add(_motorFeedback);
         commandBar.Controls.Add(_displayText);
+        commandBar.Controls.Add(_minimizeToTray);
+        commandBar.Controls.Add(_startWithWindows);
         foreach (Control control in commandBar.Controls)
         {
-            control.Width = control is CheckBox ? 150 : 104;
+            control.Width = control is CheckBox ? 132 : 104;
             control.Height = 28;
             control.Margin = new Padding(0, 0, 8, 0);
         }
@@ -180,6 +192,8 @@ public sealed class MainForm : Form
         _logLabel.Cursor = Cursors.Hand;
         _logLabel.Click += (_, _) => Process.Start("explorer.exe", $"/select,\"{_logger.CurrentLogFile}\"");
         root.Controls.Add(_logLabel, 0, 4);
+
+        ConfigureTrayIcon();
     }
 
     private static void AddLabeled(TableLayoutPanel panel, string label, Control control, int column, int row, int span = 2)
@@ -192,6 +206,41 @@ public sealed class MainForm : Form
         wrapper.Controls.Add(control, 0, 1);
         panel.Controls.Add(wrapper, column, row);
         panel.SetColumnSpan(wrapper, span);
+    }
+
+    private void ConfigureTrayIcon()
+    {
+        var menu = new ContextMenuStrip();
+        menu.Items.Add("Show", null, (_, _) => ShowFromTray());
+        menu.Items.Add("Start Bridge", null, (_, _) =>
+        {
+            if (!_connected)
+                ToggleConnection();
+        });
+        menu.Items.Add("Stop Bridge", null, (_, _) =>
+        {
+            if (_connected)
+                Disconnect();
+        });
+        menu.Items.Add(new ToolStripSeparator());
+        menu.Items.Add("Exit", null, (_, _) =>
+        {
+            _allowExit = true;
+            Close();
+        });
+
+        _trayIcon.Icon = SystemIcons.Application;
+        _trayIcon.Text = "iCON P1-M vMix Bridge";
+        _trayIcon.ContextMenuStrip = menu;
+        _trayIcon.Visible = true;
+        _trayIcon.DoubleClick += (_, _) => ShowFromTray();
+    }
+
+    private void ShowFromTray()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        Activate();
     }
 
     private void ConfigureGrid()
@@ -243,6 +292,12 @@ public sealed class MainForm : Form
         {
             if (_grid.IsCurrentCellDirty)
                 _grid.CommitEdit(DataGridViewDataErrorContexts.Commit);
+        };
+        _grid.CellBeginEdit += (_, _) => _gridEditing = true;
+        _grid.CellEndEdit += (_, _) =>
+        {
+            _gridEditing = false;
+            UpdateInputColumnDataSource();
         };
 
         _grid.Columns.Add(new DataGridViewTextBoxColumn
@@ -306,6 +361,8 @@ public sealed class MainForm : Form
         _motorHoldMs.Value = _profile.MotorFeedbackHoldMs;
         _motorFeedback.Checked = _profile.SendMotorFaderFeedback;
         _displayText.Checked = _profile.SendMackieScribbleStripText;
+        _minimizeToTray.Checked = _profile.MinimizeToTray;
+        _startWithWindows.Checked = _profile.StartWithWindows;
         PopulateGridRows();
     }
 
@@ -671,8 +728,18 @@ public sealed class MainForm : Form
                 choices.Add(new InputChoice(savedKey!, $"Missing input ({savedKey})"));
         }
 
+        var signature = string.Join("|", choices.Select(choice => $"{choice.Key}={choice.Title}"));
+        if (signature == _lastInputChoicesSignature)
+            return;
+
+        if (_gridEditing || _grid.IsCurrentCellInEditMode)
+            return;
+
         if (_grid.Columns["InputKey"] is DataGridViewComboBoxColumn combo)
+        {
             combo.DataSource = choices;
+            _lastInputChoicesSignature = signature;
+        }
     }
 
     private void UpdateLiveGridAndHardware()
@@ -683,7 +750,7 @@ public sealed class MainForm : Form
         {
             var assignment = assignments[i];
             var live = ResolveLiveChannel(assignment);
-            if (i < _grid.Rows.Count)
+            if (!_gridEditing && !_grid.IsCurrentCellInEditMode && i < _grid.Rows.Count)
             {
                 SetGridCellValue(i, "LiveVolume", live.VolumePercent.HasValue
                     ? live.VolumePercent.Value.ToString("0", CultureInfo.InvariantCulture)
@@ -696,6 +763,7 @@ public sealed class MainForm : Form
             if (_profile.SendMotorFaderFeedback &&
                 live.VolumePercent.HasValue &&
                 !_faderTouched[i] &&
+                DateTime.Now >= _blockMotorFeedbackUntil[i] &&
                 DateTime.Now - _lastFaderTouch[i] > TimeSpan.FromMilliseconds(_profile.MotorFeedbackHoldMs))
             {
                 var feedbackValue = PercentToFourteenBit(live.VolumePercent.Value);
@@ -703,6 +771,7 @@ public sealed class MainForm : Form
                 {
                     _lastMotorFeedbackValue[i] = feedbackValue;
                     _suppressIncomingFaderUntil[i] = DateTime.Now.AddMilliseconds(1000);
+                    _logger.Debug("Motor feedback ch {0}: {1:0.##}", i + 1, live.VolumePercent.Value);
                     _midi.SendPitchBend(i, feedbackValue);
                 }
             }
@@ -751,9 +820,36 @@ public sealed class MainForm : Form
         _profile.MidiOutputName = _midiOutputCombo.Text.Trim();
         _profile.SendMotorFaderFeedback = _motorFeedback.Checked;
         _profile.SendMackieScribbleStripText = _displayText.Checked;
+        _profile.MinimizeToTray = _minimizeToTray.Checked;
+        _profile.StartWithWindows = _startWithWindows.Checked;
         _profile.Channels = ReadAssignmentsFromGrid();
         _profile.Save(AppPaths.ConfigFile);
+        ConfigureStartupRegistration();
         _logger.Info("Saved profile to {0}", AppPaths.ConfigFile);
+    }
+
+    private void ConfigureStartupRegistration()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", writable: true)
+                ?? Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", writable: true);
+
+            if (_profile.StartWithWindows)
+            {
+                key.SetValue("IconP1MVmixBridge", $"\"{Application.ExecutablePath}\"");
+                _logger.Info("Configured app to start with Windows");
+            }
+            else
+            {
+                key.DeleteValue("IconP1MVmixBridge", throwOnMissingValue: false);
+                _logger.Info("Removed app from Windows startup");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Could not update Windows startup setting");
+        }
     }
 
     private List<ChannelAssignment> ReadAssignmentsFromGrid()
@@ -847,10 +943,17 @@ public sealed class MainForm : Form
             if (e.Command == 0x90 && e.Data1 is >= 0x68 and <= 0x6F)
             {
                 var channel = e.Data1 - 0x68;
+                if (DateTime.Now < _suppressIncomingFaderUntil[channel])
+                {
+                    _faderTouched[channel] = false;
+                    _logger.Debug("Ignored motor fader touch echo ch {0}: {1}", channel + 1, e.Data2 > 0 ? "on" : "off");
+                    return;
+                }
+
                 _faderTouched[channel] = e.Data2 > 0;
                 _lastFaderTouch[channel] = DateTime.Now;
-                if (_faderTouched[channel])
-                    _suppressIncomingFaderUntil[channel] = DateTime.MinValue;
+                if (!_faderTouched[channel])
+                    _blockMotorFeedbackUntil[channel] = DateTime.Now.AddSeconds(10);
 
                 _logger.Debug("MIDI fader touch ch {0}: {1}", channel + 1, _faderTouched[channel] ? "on" : "off");
                 UpdateStatus();
@@ -875,6 +978,8 @@ public sealed class MainForm : Form
                 }
 
                 _lastFaderTouch[e.Channel] = DateTime.Now;
+                _blockMotorFeedbackUntil[e.Channel] = DateTime.Now.AddSeconds(10);
+                _lastMotorFeedbackValue[e.Channel] = value14;
                 if (!double.IsNaN(_lastSentFaderPercent[e.Channel]) &&
                     Math.Abs(percent - _lastSentFaderPercent[e.Channel]) < 0.2)
                 {
@@ -913,6 +1018,7 @@ public sealed class MainForm : Form
         Array.Fill(_lastStripLabels, "");
         Array.Fill(_lastMotorFeedbackValue, -1);
         Array.Fill(_faderTouched, false);
+        Array.Fill(_blockMotorFeedbackUntil, DateTime.MinValue);
     }
 
     private static StripColor NormalizeStripColor(StripColor color) => Enum.IsDefined(color) ? color : StripColor.Blue;
@@ -952,15 +1058,31 @@ public sealed class MainForm : Form
 
     private static double XmlVolumeToFaderPercent(double xmlVolume)
     {
-        // vMix XML volume is amplitude scaled 0-100; the API fader position is 0-100.
+        // vMix XML volume is amplitude scaled 0-100; vMix UI/API fader position is 0-100.
         var amplitude = Math.Clamp(xmlVolume, 0, 100) / 100.0;
         return Math.Pow(amplitude, 0.25) * 100.0;
     }
 
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (_minimizeToTray.Checked && WindowState == FormWindowState.Minimized)
+            Hide();
+    }
+
     protected override void OnFormClosing(FormClosingEventArgs e)
     {
+        if (!_allowExit && _minimizeToTray.Checked && e.CloseReason == CloseReason.UserClosing)
+        {
+            e.Cancel = true;
+            Hide();
+            return;
+        }
+
         SaveProfile();
         Disconnect();
+        _trayIcon.Visible = false;
+        _trayIcon.Dispose();
         _vmix.Dispose();
         _midi.Dispose();
         base.OnFormClosing(e);
