@@ -205,15 +205,25 @@ public sealed class VMixClient : IDisposable
             .ToList() ?? [];
 
         var outputVolumes = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
+        var outputMeters = new Dictionary<string, double>(StringComparer.OrdinalIgnoreCase);
         var audio = doc.Root?.Element("audio");
         if (audio is not null)
         {
+            foreach (var output in audio.Elements())
+            {
+                var name = output.Name.LocalName;
+                if (double.TryParse(Attr(output, "volume"), NumberStyles.Float, CultureInfo.InvariantCulture, out var volume))
+                    outputVolumes[name] = volume;
+
+                outputMeters[name] = Math.Max(DoubleAttr(output, "meterF1"), DoubleAttr(output, "meterF2"));
+            }
+
             foreach (var attr in audio.Attributes())
             {
                 if (attr.Name.LocalName.EndsWith("Volume", StringComparison.OrdinalIgnoreCase) &&
                     double.TryParse(attr.Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var value))
                 {
-                    outputVolumes[attr.Name.LocalName] = value;
+                    outputVolumes[AudioAttributeToOutputName(attr.Name.LocalName)] = value;
                 }
             }
         }
@@ -223,8 +233,23 @@ public sealed class VMixClient : IDisposable
             Connected = true,
             Status = $"Connected. {inputs.Count} inputs.",
             Inputs = inputs,
-            OutputVolumes = outputVolumes
+            OutputVolumes = outputVolumes,
+            OutputMeters = outputMeters
         };
+    }
+
+    private static string AudioAttributeToOutputName(string attributeName)
+    {
+        if (attributeName.Equals("masterVolume", StringComparison.OrdinalIgnoreCase))
+            return "master";
+
+        if (attributeName.StartsWith("bus", StringComparison.OrdinalIgnoreCase) &&
+            attributeName.EndsWith("Volume", StringComparison.OrdinalIgnoreCase))
+        {
+            return attributeName[..^"Volume".Length];
+        }
+
+        return attributeName;
     }
 
     private static string UrlEncode(string value) => Uri.EscapeDataString(value);

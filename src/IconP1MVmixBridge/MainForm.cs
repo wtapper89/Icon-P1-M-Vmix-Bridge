@@ -46,6 +46,7 @@ public sealed class MainForm : Form
     private readonly bool[] _pendingFaderDirty = new bool[8];
     private readonly bool[] _faderSendInFlight = new bool[8];
     private readonly string[] _lastStripLabels = Enumerable.Repeat("", 8).ToArray();
+    private readonly bool[] _faderTouched = new bool[8];
 
     public MainForm(FileLogger logger)
     {
@@ -694,13 +695,14 @@ public sealed class MainForm : Form
 
             if (_profile.SendMotorFaderFeedback &&
                 live.VolumePercent.HasValue &&
+                !_faderTouched[i] &&
                 DateTime.Now - _lastFaderTouch[i] > TimeSpan.FromMilliseconds(_profile.MotorFeedbackHoldMs))
             {
                 var feedbackValue = PercentToFourteenBit(live.VolumePercent.Value);
                 if (Math.Abs(feedbackValue - _lastMotorFeedbackValue[i]) > 8)
                 {
                     _lastMotorFeedbackValue[i] = feedbackValue;
-                    _suppressIncomingFaderUntil[i] = DateTime.Now.AddMilliseconds(250);
+                    _suppressIncomingFaderUntil[i] = DateTime.Now.AddMilliseconds(1000);
                     _midi.SendPitchBend(i, feedbackValue);
                 }
             }
@@ -799,21 +801,24 @@ public sealed class MainForm : Form
 
         var outputName = assignment.Kind switch
         {
-            AssignmentKind.Master => "masterVolume",
-            AssignmentKind.BusA => "busAVolume",
-            AssignmentKind.BusB => "busBVolume",
-            AssignmentKind.BusC => "busCVolume",
-            AssignmentKind.BusD => "busDVolume",
-            AssignmentKind.BusE => "busEVolume",
-            AssignmentKind.BusF => "busFVolume",
-            AssignmentKind.BusG => "busGVolume",
+            AssignmentKind.Master => "master",
+            AssignmentKind.BusA => "busA",
+            AssignmentKind.BusB => "busB",
+            AssignmentKind.BusC => "busC",
+            AssignmentKind.BusD => "busD",
+            AssignmentKind.BusE => "busE",
+            AssignmentKind.BusF => "busF",
+            AssignmentKind.BusG => "busG",
             _ => ""
         };
 
         if (!string.IsNullOrWhiteSpace(outputName) && _state.OutputVolumes.TryGetValue(outputName, out var volume))
         {
             var label = string.IsNullOrWhiteSpace(assignment.LabelOverride) ? assignment.Kind.ToString() : assignment.LabelOverride;
-            return new LiveChannel(label, XmlVolumeToFaderPercent(volume), null);
+            double? meter = _state.OutputMeters.TryGetValue(outputName, out var meterValue)
+                ? VmixMeterToDisplayPercent(meterValue)
+                : null;
+            return new LiveChannel(label, XmlVolumeToFaderPercent(volume), meter);
         }
 
         return new LiveChannel(string.IsNullOrWhiteSpace(assignment.LabelOverride) ? assignment.Kind.ToString() : assignment.LabelOverride, null, null);
@@ -839,13 +844,31 @@ public sealed class MainForm : Form
         {
             _lastMidiMessage = $"{e.Status:X2} {e.Data1:X2} {e.Data2:X2} ch {e.Channel + 1}";
             _logger.Debug("MIDI received: status {0:X2}, data1 {1:X2}, data2 {2:X2}, channel {3}, command {4:X2}", e.Status, e.Data1, e.Data2, e.Channel + 1, e.Command);
+            if (e.Command == 0x90 && e.Data1 is >= 0x68 and <= 0x6F)
+            {
+                var channel = e.Data1 - 0x68;
+                _faderTouched[channel] = e.Data2 > 0;
+                _lastFaderTouch[channel] = DateTime.Now;
+                if (_faderTouched[channel])
+                    _suppressIncomingFaderUntil[channel] = DateTime.MinValue;
+
+                _logger.Debug("MIDI fader touch ch {0}: {1}", channel + 1, _faderTouched[channel] ? "on" : "off");
+                UpdateStatus();
+                return;
+            }
+
             var assignments = ReadAssignmentsFromGrid();
             if (e.Command == 0xE0 && e.Channel is >= 0 and < 8)
             {
                 var value14 = e.Data1 | (e.Data2 << 7);
                 var percent = value14 / 16383.0 * 100.0;
-                if (DateTime.Now < _suppressIncomingFaderUntil[e.Channel] &&
-                    Math.Abs(value14 - _lastMotorFeedbackValue[e.Channel]) <= 64)
+                if (_profile.InputFadersAreTouchSensitive && !_faderTouched[e.Channel])
+                {
+                    _logger.Debug("Ignored untouched fader ch {0}: {1:0.##}", e.Channel + 1, percent);
+                    return;
+                }
+
+                if (DateTime.Now < _suppressIncomingFaderUntil[e.Channel])
                 {
                     _logger.Debug("Suppressed motor-feedback echo ch {0}: {1:0.##}", e.Channel + 1, percent);
                     return;
@@ -889,6 +912,7 @@ public sealed class MainForm : Form
     {
         Array.Fill(_lastStripLabels, "");
         Array.Fill(_lastMotorFeedbackValue, -1);
+        Array.Fill(_faderTouched, false);
     }
 
     private static StripColor NormalizeStripColor(StripColor color) => Enum.IsDefined(color) ? color : StripColor.Blue;

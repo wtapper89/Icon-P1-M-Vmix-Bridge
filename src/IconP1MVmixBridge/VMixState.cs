@@ -5,6 +5,7 @@ public sealed class VMixState
     public DateTimeOffset UpdatedAt { get; init; } = DateTimeOffset.Now;
     public List<VMixInput> Inputs { get; init; } = [];
     public Dictionary<string, double> OutputVolumes { get; init; } = new(StringComparer.OrdinalIgnoreCase);
+    public Dictionary<string, double> OutputMeters { get; init; } = new(StringComparer.OrdinalIgnoreCase);
     public bool Connected { get; init; }
     public string Status { get; init; } = "Not connected";
 }
