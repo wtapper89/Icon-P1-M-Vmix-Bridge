@@ -25,6 +25,7 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _faderWriteMs = new();
     private readonly NumericUpDown _motorHoldMs = new();
     private readonly NumericUpDown _apiPort = new();
+    private readonly NumericUpDown _channelCount = new();
     private readonly CheckBox _motorFeedback = new();
     private readonly CheckBox _displayText = new();
     private readonly CheckBox _minimizeToTray = new();
@@ -37,6 +38,9 @@ public sealed class MainForm : Form
     private readonly Button _refreshVmixButton = new();
     private readonly Button _openMidiButton = new();
     private readonly Button _testMidiButton = new();
+    private readonly Button _previousBankButton = new();
+    private readonly Button _nextBankButton = new();
+    private readonly Label _bankLabel = new();
     private VMixState _state = new();
     private CancellationTokenSource? _pollCts;
     private bool _connected;
@@ -57,6 +61,7 @@ public sealed class MainForm : Form
     private bool _allowExit;
     private bool _gridEditing;
     private string _lastInputChoicesSignature = "";
+    private int _bankStartChannel;
 
     public MainForm(FileLogger logger)
     {
@@ -116,6 +121,7 @@ public sealed class MainForm : Form
         AddLabeled(settings, "Fader ms", _faderWriteMs, 0, 2, 2);
         AddLabeled(settings, "Motor hold ms", _motorHoldMs, 2, 2, 3);
         AddLabeled(settings, "API Port", _apiPort, 5, 2, 2);
+        AddLabeled(settings, "Channels", _channelCount, 7, 2, 3);
 
         _httpPort.Minimum = 1;
         _httpPort.Maximum = 65535;
@@ -132,6 +138,9 @@ public sealed class MainForm : Form
         _motorHoldMs.Increment = 250;
         _apiPort.Minimum = 1;
         _apiPort.Maximum = 65535;
+        _channelCount.Minimum = 8;
+        _channelCount.Maximum = 64;
+        _channelCount.Increment = 8;
         _midiInputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
         _midiOutputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
         _midiInputCombo.SelectedIndexChanged += (_, _) => SuggestMatchingMidiOutput();
@@ -155,6 +164,12 @@ public sealed class MainForm : Form
         _openMidiButton.Click += (_, _) => ToggleMidi();
         _testMidiButton.Text = "Test MIDI";
         _testMidiButton.Click += (_, _) => TestMidiOutput();
+        _previousBankButton.Text = "<< Bank";
+        _previousBankButton.Click += (_, _) => ChangeBank(-8, "UI previous bank");
+        _nextBankButton.Text = "Bank >>";
+        _nextBankButton.Click += (_, _) => ChangeBank(8, "UI next bank");
+        _bankLabel.Text = "Bank 1-8";
+        _bankLabel.TextAlign = ContentAlignment.MiddleLeft;
         var refreshMidi = new Button { Text = "Refresh MIDI", Dock = DockStyle.Fill };
         refreshMidi.Click += (_, _) => RefreshMidiDevices();
 
@@ -172,13 +187,16 @@ public sealed class MainForm : Form
         commandBar.Controls.Add(_testMidiButton);
         commandBar.Controls.Add(_connectButton);
         commandBar.Controls.Add(_stopBridgeButton);
+        commandBar.Controls.Add(_previousBankButton);
+        commandBar.Controls.Add(_nextBankButton);
+        commandBar.Controls.Add(_bankLabel);
         commandBar.Controls.Add(_motorFeedback);
         commandBar.Controls.Add(_displayText);
         commandBar.Controls.Add(_minimizeToTray);
         commandBar.Controls.Add(_startWithWindows);
         foreach (Control control in commandBar.Controls)
         {
-            control.Width = control is CheckBox ? 132 : 104;
+            control.Width = control == _bankLabel ? 156 : control is CheckBox ? 132 : 104;
             control.Height = 28;
             control.Margin = new Padding(0, 0, 8, 0);
         }
@@ -271,13 +289,6 @@ public sealed class MainForm : Form
         _grid.DataError += (_, e) =>
         {
             _logger.Warn("Grid data error at row {0}, column {1}: {2}", e.RowIndex, e.ColumnIndex, e.Exception?.Message ?? "Unknown error");
-            if (e.RowIndex >= 0 &&
-                e.ColumnIndex >= 0 &&
-                _grid.Columns[e.ColumnIndex].Name == "StripColor" &&
-                e.RowIndex < _grid.Rows.Count)
-            {
-                SetGridCellValue(e.RowIndex, "StripColor", StripColor.Blue);
-            }
             e.ThrowException = false;
         };
         _grid.CellFormatting += (_, e) =>
@@ -339,6 +350,8 @@ public sealed class MainForm : Form
             Name = "StripColor",
             HeaderText = "Strip Color",
             DataSource = Enum.GetValues<StripColor>(),
+            ValueType = typeof(StripColor),
+            FlatStyle = FlatStyle.Flat,
             FillWeight = 90
         });
         _grid.Columns.Add(new DataGridViewTextBoxColumn
@@ -366,6 +379,7 @@ public sealed class MainForm : Form
         _faderWriteMs.Value = _profile.FaderWriteIntervalMs;
         _motorHoldMs.Value = _profile.MotorFeedbackHoldMs;
         _apiPort.Value = _profile.ApiPort;
+        _channelCount.Value = _profile.ChannelCount;
         _motorFeedback.Checked = _profile.SendMotorFaderFeedback;
         _displayText.Checked = _profile.SendMackieScribbleStripText;
         _minimizeToTray.Checked = _profile.MinimizeToTray;
@@ -384,6 +398,8 @@ public sealed class MainForm : Form
             {
                 _grid.Rows.Add(assignment.Channel, assignment.Kind, assignment.InputKey ?? "", assignment.LabelOverride, NormalizeStripColor(assignment.StripColor), "", "");
             }
+            ClampBankStart();
+            UpdateBankUi();
         }
         finally
         {
@@ -662,6 +678,10 @@ public sealed class MainForm : Form
             if (!_pendingFaderDirty[channel] || _faderSendInFlight[channel])
                 continue;
 
+            var logical = LogicalIndexForPhysical(channel);
+            if (logical < 0 || logical >= assignments.Count)
+                continue;
+
             var percent = _pendingFaderPercent[channel];
             if (double.IsNaN(percent))
                 continue;
@@ -670,7 +690,7 @@ public sealed class MainForm : Form
             _lastVmixFaderSend[channel] = DateTime.Now;
             _lastSentFaderPercent[channel] = percent;
             _faderSendInFlight[channel] = true;
-            _ = SendFaderUpdateAsync(channel, assignments[channel], percent);
+            _ = SendFaderUpdateAsync(channel, assignments[logical], percent);
         }
     }
 
@@ -726,9 +746,10 @@ public sealed class MainForm : Form
         var bridge = _connected ? "running" : "stopped";
         var vmix = _state.Connected ? _state.Status : $"vMix not connected: {_state.Status}";
         var api = $"API: 127.0.0.1:{(int)_apiPort.Value}";
+        var bank = $"Bank: {_bankStartChannel + 1}-{Math.Min(_bankStartChannel + 8, Math.Max(_grid.Rows.Count, 8))}";
         _statusLabel.Text = alert is null
-            ? $"Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput} | {api} | Last MIDI: {_lastMidiMessage}"
-            : $"{alert} | Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput} | {api}";
+            ? $"Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput} | {bank} | {api} | Last MIDI: {_lastMidiMessage}"
+            : $"{alert} | Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput} | {bank} | {api}";
     }
 
     private static string EmptyIfBlank(string value) => string.IsNullOrWhiteSpace(value) ? "<none>" : value.Trim();
@@ -767,7 +788,9 @@ public sealed class MainForm : Form
     private void UpdateLiveGridAndHardware()
     {
         var assignments = ReadAssignmentsFromGrid();
-        _midi.SendIconDisplayColors(assignments.Select(assignment => assignment.StripColor).ToList());
+        ClampBankStart(assignments.Count);
+        UpdateBankUi();
+        _midi.SendIconDisplayColors(GetActiveBankAssignments(assignments).Select(assignment => assignment.StripColor).ToList());
         for (var i = 0; i < assignments.Count; i++)
         {
             var assignment = assignments[i];
@@ -782,22 +805,95 @@ public sealed class MainForm : Form
                     : "");
             }
 
-            if (_profile.SendMotorFaderFeedback &&
-                live.VolumePercent.HasValue &&
-                !_faderTouched[i] &&
-                DateTime.Now - _lastFaderTouch[i] > TimeSpan.FromMilliseconds(_profile.MotorFeedbackHoldMs))
+        }
+
+        for (var physical = 0; physical < 8; physical++)
+        {
+            var logical = _bankStartChannel + physical;
+            if (logical >= assignments.Count)
             {
-                SendMotorFeedback(i, live.VolumePercent.Value, "vMix poll");
+                if (_profile.SendMackieScribbleStripText && !string.Equals(_lastStripLabels[physical], "", StringComparison.Ordinal))
+                {
+                    _lastStripLabels[physical] = "";
+                    _midi.SendMackieScribbleText(physical, "");
+                }
+                _midi.SendMackieMeter(physical, 0);
+                continue;
             }
 
-            if (_profile.SendMackieScribbleStripText && !string.Equals(_lastStripLabels[i], live.Label, StringComparison.Ordinal))
+            var assignment = assignments[logical];
+            var live = ResolveLiveChannel(assignment);
+            if (_profile.SendMotorFaderFeedback &&
+                live.VolumePercent.HasValue &&
+                !_faderTouched[physical] &&
+                DateTime.Now - _lastFaderTouch[physical] > TimeSpan.FromMilliseconds(_profile.MotorFeedbackHoldMs))
             {
-                _lastStripLabels[i] = live.Label;
-                _midi.SendMackieScribbleText(i, live.Label);
+                SendMotorFeedback(physical, live.VolumePercent.Value, $"vMix poll logical ch {logical + 1}");
+            }
+
+            if (_profile.SendMackieScribbleStripText && !string.Equals(_lastStripLabels[physical], live.Label, StringComparison.Ordinal))
+            {
+                _lastStripLabels[physical] = live.Label;
+                _midi.SendMackieScribbleText(physical, live.Label);
             }
 
             if (live.MeterPercent.HasValue)
-                _midi.SendMackieMeter(i, MeterPercentToMackieLevel(live.MeterPercent.Value));
+                _midi.SendMackieMeter(physical, MeterPercentToMackieLevel(live.MeterPercent.Value));
+        }
+    }
+
+    private List<ChannelAssignment> GetActiveBankAssignments(IReadOnlyList<ChannelAssignment> assignments)
+    {
+        var active = new List<ChannelAssignment>();
+        for (var physical = 0; physical < 8; physical++)
+        {
+            var logical = _bankStartChannel + physical;
+            active.Add(logical < assignments.Count ? assignments[logical] : new ChannelAssignment { Channel = logical + 1 });
+        }
+        return active;
+    }
+
+    private int LogicalIndexForPhysical(int zeroBasedPhysicalChannel) => _bankStartChannel + zeroBasedPhysicalChannel;
+
+    private void ClampBankStart(int? assignmentCount = null)
+    {
+        var count = assignmentCount ?? _grid.Rows.Count;
+        var maxStart = Math.Max(0, count - 8);
+        _bankStartChannel = Math.Clamp(_bankStartChannel, 0, maxStart);
+    }
+
+    private void ChangeBank(int delta, string reason)
+    {
+        var oldStart = _bankStartChannel;
+        _bankStartChannel += delta;
+        ClampBankStart();
+        if (_bankStartChannel == oldStart)
+        {
+            _logger.Info("Bank unchanged at {0}-{1}; reason={2}", _bankStartChannel + 1, Math.Min(_bankStartChannel + 8, _grid.Rows.Count), reason);
+            UpdateBankUi();
+            return;
+        }
+
+        ResetHardwareFeedbackCache();
+        UpdateBankUi();
+        _logger.Info("Changed active P1-M bank to logical channels {0}-{1}; reason={2}",
+            _bankStartChannel + 1,
+            Math.Min(_bankStartChannel + 8, _grid.Rows.Count),
+            reason);
+        UpdateLiveGridAndHardware();
+        UpdateStatus();
+    }
+
+    private void UpdateBankUi()
+    {
+        var end = Math.Min(_bankStartChannel + 8, Math.Max(_grid.Rows.Count, 8));
+        _bankLabel.Text = $"Bank {_bankStartChannel + 1}-{end} of {_grid.Rows.Count}";
+        _previousBankButton.Enabled = _bankStartChannel > 0;
+        _nextBankButton.Enabled = _bankStartChannel + 8 < _grid.Rows.Count;
+        for (var row = 0; row < _grid.Rows.Count; row++)
+        {
+            var inBank = row >= _bankStartChannel && row < _bankStartChannel + 8;
+            _grid.Rows[row].DefaultCellStyle.BackColor = inBank ? Color.FromArgb(232, 242, 255) : Color.White;
         }
     }
 
@@ -821,7 +917,8 @@ public sealed class MainForm : Form
     private async Task SetChannelVolumeFromSurfaceAsync(int zeroBasedChannel, double volumePercent, string reason)
     {
         var assignments = ReadAssignmentsFromGrid();
-        if (zeroBasedChannel < 0 || zeroBasedChannel >= assignments.Count)
+        var logical = LogicalIndexForPhysical(zeroBasedChannel);
+        if (zeroBasedChannel < 0 || zeroBasedChannel >= 8 || logical < 0 || logical >= assignments.Count)
             return;
 
         volumePercent = Math.Clamp(volumePercent, 0, 100);
@@ -829,9 +926,13 @@ public sealed class MainForm : Form
         _pendingFaderPercent[zeroBasedChannel] = double.NaN;
         _lastSentFaderPercent[zeroBasedChannel] = volumePercent;
 
-        _logger.Info("Surface button set channel {0} to {1:0.##}% ({2})", zeroBasedChannel + 1, volumePercent, reason);
-        await _vmix.SetAssignmentVolumeFastAsync(assignments[zeroBasedChannel], volumePercent, _pollCts?.Token ?? CancellationToken.None);
-        SetGridCellValue(zeroBasedChannel, "LiveVolume", volumePercent.ToString("0", CultureInfo.InvariantCulture));
+        _logger.Info("Surface button set physical channel {0}, logical channel {1} to {2:0.##}% ({3})",
+            zeroBasedChannel + 1,
+            logical + 1,
+            volumePercent,
+            reason);
+        await _vmix.SetAssignmentVolumeFastAsync(assignments[logical], volumePercent, _pollCts?.Token ?? CancellationToken.None);
+        SetGridCellValue(logical, "LiveVolume", volumePercent.ToString("0", CultureInfo.InvariantCulture));
         SendMotorFeedback(zeroBasedChannel, volumePercent, reason);
     }
 
@@ -865,7 +966,9 @@ public sealed class MainForm : Form
         _profile.FaderWriteIntervalMs = (int)_faderWriteMs.Value;
         _profile.MotorFeedbackHoldMs = (int)_motorHoldMs.Value;
         var previousApiPort = _profile.ApiPort;
+        var previousChannelCount = _profile.ChannelCount;
         _profile.ApiPort = (int)_apiPort.Value;
+        _profile.ChannelCount = (int)_channelCount.Value;
         _profile.MidiInputName = _midiInputCombo.Text.Trim();
         _profile.MidiOutputName = _midiOutputCombo.Text.Trim();
         _profile.SendMotorFaderFeedback = _motorFeedback.Checked;
@@ -877,6 +980,10 @@ public sealed class MainForm : Form
         ConfigureStartupRegistration();
         if (_profile.ApiPort != previousApiPort)
             StartApiServer();
+        if (_profile.ChannelCount != previousChannelCount || _grid.Rows.Count != _profile.ChannelCount)
+            PopulateGridRows();
+        else
+            UpdateLiveGridAndHardware();
         _logger.Info("Saved profile to {0}", AppPaths.ConfigFile);
     }
 
@@ -933,8 +1040,8 @@ public sealed class MainForm : Form
 
     private ApiAssignmentResponse ApplyApiAssignment(int channel, ApiAssignmentRequest request)
     {
-        if (channel is < 1 or > 8)
-            return new ApiAssignmentResponse(false, "Channel must be 1-8.");
+        if (channel < 1 || channel > _profile.ChannelCount)
+            return new ApiAssignmentResponse(false, $"Channel must be 1-{_profile.ChannelCount}.");
 
         var rowIndex = channel - 1;
         if (rowIndex >= _grid.Rows.Count)
@@ -1194,11 +1301,24 @@ public sealed class MainForm : Form
                 return;
             }
 
+            if (TryHandleNavigationMidi(e))
+                return;
+
             if (e.Command == 0xE0 && e.Channel is >= 0 and < 8)
             {
+                var logical = LogicalIndexForPhysical(e.Channel);
                 var value14 = e.Data1 | (e.Data2 << 7);
                 var percent = value14 / 16383.0 * 100.0;
                 var now = DateTime.Now;
+                if (logical < 0 || logical >= _grid.Rows.Count)
+                {
+                    _logger.Debug("Ignored fader on physical ch {0}: no logical assignment in active bank {1}-{2}",
+                        e.Channel + 1,
+                        _bankStartChannel + 1,
+                        Math.Min(_bankStartChannel + 8, _grid.Rows.Count));
+                    return;
+                }
+
                 if (now < _ignoreLocalFaderUntil[e.Channel])
                 {
                     _logger.Debug("Ignored post-release fader movement ch {0}: {1:0.##}% raw {2}; ignore remaining {3:0} ms",
@@ -1240,12 +1360,13 @@ public sealed class MainForm : Form
 
                 _pendingFaderPercent[e.Channel] = percent;
                 _pendingFaderDirty[e.Channel] = true;
-                _logger.Debug("MIDI fader ch {0}: {1:0.##}% raw {2}; touched={3}",
+                _logger.Debug("MIDI fader physical ch {0}, logical ch {1}: {2:0.##}% raw {3}; touched={4}",
                     e.Channel + 1,
+                    logical + 1,
                     percent,
                     value14,
                     _faderTouched[e.Channel]);
-                SetGridCellValue(e.Channel, "LiveVolume", percent.ToString("0", CultureInfo.InvariantCulture));
+                SetGridCellValue(logical, "LiveVolume", percent.ToString("0", CultureInfo.InvariantCulture));
                 UpdateStatus();
             }
             else if (e.Command == 0x90 && e.Data2 > 0 && e.Data1 is >= 0 and <= 7)
@@ -1272,6 +1393,43 @@ public sealed class MainForm : Form
             _logger.Error(ex, "MIDI action failed. Raw message {0:X6}", e.RawMessage);
             UpdateStatus($"MIDI action failed: {ex.Message}");
         }
+    }
+
+    private bool TryHandleNavigationMidi(MidiMessageEventArgs e)
+    {
+        if (e.Command == 0x90 && e.Data2 > 0)
+        {
+            switch (e.Data1)
+            {
+                case 0x2E:
+                    ChangeBank(-8, "MIDI bank left");
+                    return true;
+                case 0x2F:
+                    ChangeBank(8, "MIDI bank right");
+                    return true;
+                case 0x30:
+                    ChangeBank(-1, "MIDI channel left");
+                    return true;
+                case 0x31:
+                    ChangeBank(1, "MIDI channel right");
+                    return true;
+                case 0x5B:
+                    ChangeBank(-8, "MIDI rewind/previous bank");
+                    return true;
+                case 0x5C:
+                    ChangeBank(8, "MIDI fast-forward/next bank");
+                    return true;
+            }
+        }
+
+        if (e.Command == 0xB0 && e.Data1 == 0x3C)
+        {
+            var delta = e.Data2 <= 0x3F ? 8 : -8;
+            ChangeBank(delta, $"MIDI jog wheel value {e.Data2}");
+            return true;
+        }
+
+        return false;
     }
 
     private static int PercentToFourteenBit(double percent) => (int)Math.Round(Math.Clamp(percent, 0, 100) / 100.0 * 16383);

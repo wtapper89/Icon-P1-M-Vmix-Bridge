@@ -9,6 +9,7 @@ It is built for operators who need quick control during services, live streams, 
 - See audio level activity on the P1-M meters.
 - Let motorized faders follow vMix when someone changes a level in vMix.
 - Quickly reassign each P1-M channel from inside the app.
+- Store more than 8 logical channels and switch the P1-M between banks.
 - Optionally reassign channels from another program using a simple local API.
 
 ## Quick Start
@@ -75,9 +76,11 @@ MIDI Out: open
 
 Each row in the app is one P1-M channel strip.
 
+The P1-M has 8 physical faders, but the bridge can store more than 8 logical channels. Use the `Channels` setting to choose how many rows you want, then use `<< Bank` and `Bank >>` to choose which group of 8 the P1-M is currently controlling.
+
 Use the table in the app:
 
-- `P1-M Channel`: the physical fader number.
+- `P1-M Channel`: the logical channel number in the bridge profile.
 - `Assignment`: choose what the fader controls.
 - `vMix Input`: choose the vMix source when `Assignment` is `Input`.
 - `Label Override`: optional short name to show on the P1-M display.
@@ -100,6 +103,24 @@ The app saves your assignments here:
 ```
 
 The assignments should load again the next time you open the app.
+
+## Switching Banks
+
+The highlighted rows in the table show the active bank. Those are the channels currently mapped to the 8 physical P1-M faders.
+
+You can switch banks from the app:
+
+- Click `<< Bank` to move to the previous group.
+- Click `Bank >>` to move to the next group.
+
+The bridge also listens for common Mackie/Logic Pro navigation controls:
+
+- Bank left/right buttons move by 8 channels.
+- Channel left/right buttons move by 1 channel.
+- Rewind/fast-forward buttons can move to the previous/next bank.
+- Jog wheel messages can move to the previous/next bank.
+
+If your P1-M button sends a different MIDI message, the log will show the raw message so it can be mapped.
 
 ## What The P1-M Controls Do
 
@@ -143,9 +164,10 @@ Run this before a service or event.
 6. Click `Start Bridge`.
 7. Move channel 1 on the P1-M and confirm the assigned vMix volume moves.
 8. Move the same fader in vMix and confirm the P1-M motor fader follows.
-9. Press the channel record button and confirm the volume goes to `100`.
-10. Press the channel mute button and confirm the volume goes to `0`.
-11. Speak or play audio into a source and confirm the meter responds.
+9. Click `Bank >>` and confirm the P1-M display changes to the next bank.
+10. Press the channel record button and confirm the active channel volume goes to `100`.
+11. Press the channel mute button and confirm the active channel volume goes to `0`.
+12. Speak or play audio into a source and confirm the meter responds.
 
 ## Running In The Background
 

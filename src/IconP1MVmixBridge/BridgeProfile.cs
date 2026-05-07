@@ -12,6 +12,7 @@ public sealed class BridgeProfile
     public int FaderWriteIntervalMs { get; set; } = 15;
     public int MotorFeedbackHoldMs { get; set; } = 1800;
     public int ApiPort { get; set; } = 8097;
+    public int ChannelCount { get; set; } = 16;
     public string MidiInputName { get; set; } = "";
     public string MidiOutputName { get; set; } = "";
     public bool SendMackieScribbleStripText { get; set; } = true;
@@ -62,13 +63,14 @@ public sealed class BridgeProfile
         FaderWriteIntervalMs = Math.Clamp(FaderWriteIntervalMs, 10, 500);
         MotorFeedbackHoldMs = Math.Clamp(MotorFeedbackHoldMs, 250, 5000);
         ApiPort = Math.Clamp(ApiPort, 1, 65535);
+        ChannelCount = Math.Clamp(ChannelCount, 8, 64);
 
         var byChannel = Channels
-            .Where(c => c.Channel is >= 1 and <= 8)
+            .Where(c => c.Channel >= 1 && c.Channel <= ChannelCount)
             .GroupBy(c => c.Channel)
             .ToDictionary(g => g.Key, g => g.First());
 
-        Channels = Enumerable.Range(1, 8)
+        Channels = Enumerable.Range(1, ChannelCount)
             .Select(index => byChannel.TryGetValue(index, out var existing)
                 ? existing with { Channel = index }
                 : new ChannelAssignment { Channel = index })
