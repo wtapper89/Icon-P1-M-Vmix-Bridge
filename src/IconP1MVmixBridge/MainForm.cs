@@ -12,6 +12,7 @@ public sealed class MainForm : Form
     private readonly BridgeProfile _profile;
     private readonly VMixClient _vmix;
     private readonly MidiDeviceManager _midi;
+    private readonly BridgeApiServer _apiServer;
     private readonly System.Windows.Forms.Timer _pollTimer = new();
     private readonly System.Windows.Forms.Timer _faderSendTimer = new();
     private readonly DataGridView _grid = new();
@@ -23,6 +24,7 @@ public sealed class MainForm : Form
     private readonly NumericUpDown _pollMs = new();
     private readonly NumericUpDown _faderWriteMs = new();
     private readonly NumericUpDown _motorHoldMs = new();
+    private readonly NumericUpDown _apiPort = new();
     private readonly CheckBox _motorFeedback = new();
     private readonly CheckBox _displayText = new();
     private readonly CheckBox _minimizeToTray = new();
@@ -50,7 +52,6 @@ public sealed class MainForm : Form
     private readonly bool[] _faderSendInFlight = new bool[8];
     private readonly string[] _lastStripLabels = Enumerable.Repeat("", 8).ToArray();
     private readonly bool[] _faderTouched = new bool[8];
-    private readonly DateTime[] _blockMotorFeedbackUntil = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
     private readonly DateTime[] _ignoreLocalFaderUntil = Enumerable.Repeat(DateTime.MinValue, 8).ToArray();
     private readonly NotifyIcon _trayIcon = new();
     private bool _allowExit;
@@ -63,6 +64,7 @@ public sealed class MainForm : Form
         _profile = BridgeProfile.LoadOrCreate(AppPaths.ConfigFile, logger);
         _vmix = new VMixClient(logger);
         _midi = new MidiDeviceManager(logger);
+        _apiServer = new BridgeApiServer(logger, GetApiSnapshotThreadSafe, SetAssignmentFromApiAsync);
         _midi.MessageReceived += OnMidiMessageReceived;
 
         Text = "iCON P1-M vMix Bridge";
@@ -113,6 +115,7 @@ public sealed class MainForm : Form
         AddLabeled(settings, "MIDI Output", _midiOutputCombo, 5, 1, 5);
         AddLabeled(settings, "Fader ms", _faderWriteMs, 0, 2, 2);
         AddLabeled(settings, "Motor hold ms", _motorHoldMs, 2, 2, 3);
+        AddLabeled(settings, "API Port", _apiPort, 5, 2, 2);
 
         _httpPort.Minimum = 1;
         _httpPort.Maximum = 65535;
@@ -127,6 +130,8 @@ public sealed class MainForm : Form
         _motorHoldMs.Minimum = 250;
         _motorHoldMs.Maximum = 5000;
         _motorHoldMs.Increment = 250;
+        _apiPort.Minimum = 1;
+        _apiPort.Maximum = 65535;
         _midiInputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
         _midiOutputCombo.DropDownStyle = ComboBoxStyle.DropDownList;
         _midiInputCombo.SelectedIndexChanged += (_, _) => SuggestMatchingMidiOutput();
@@ -360,6 +365,7 @@ public sealed class MainForm : Form
         _pollMs.Value = _profile.PollIntervalMs;
         _faderWriteMs.Value = _profile.FaderWriteIntervalMs;
         _motorHoldMs.Value = _profile.MotorFeedbackHoldMs;
+        _apiPort.Value = _profile.ApiPort;
         _motorFeedback.Checked = _profile.SendMotorFaderFeedback;
         _displayText.Checked = _profile.SendMackieScribbleStripText;
         _minimizeToTray.Checked = _profile.MinimizeToTray;
@@ -497,9 +503,23 @@ public sealed class MainForm : Form
         _faderSendTimer.Tick += (_, _) => FlushPendingFaders();
     }
 
+    private void StartApiServer()
+    {
+        try
+        {
+            _apiServer.Start(_profile.ApiPort);
+        }
+        catch (Exception ex)
+        {
+            _logger.Error(ex, "Could not start assignment API on port {0}", _profile.ApiPort);
+            UpdateStatus($"Assignment API failed on port {_profile.ApiPort}: {ex.Message}");
+        }
+    }
+
     protected override async void OnShown(EventArgs e)
     {
         base.OnShown(e);
+        StartApiServer();
         await RefreshVmixInputsAsync();
     }
 
@@ -705,9 +725,10 @@ public sealed class MainForm : Form
         var midiOutput = _midi.OutputOpen ? $"open ({_midi.OpenOutputName})" : $"closed (selected: {EmptyIfBlank(_midiOutputCombo.Text)})";
         var bridge = _connected ? "running" : "stopped";
         var vmix = _state.Connected ? _state.Status : $"vMix not connected: {_state.Status}";
+        var api = $"API: 127.0.0.1:{(int)_apiPort.Value}";
         _statusLabel.Text = alert is null
-            ? $"Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput} | Last MIDI: {_lastMidiMessage}"
-            : $"{alert} | Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput}";
+            ? $"Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput} | {api} | Last MIDI: {_lastMidiMessage}"
+            : $"{alert} | Bridge: {bridge} | {vmix} | MIDI In: {midiInput} | MIDI Out: {midiOutput} | {api}";
     }
 
     private static string EmptyIfBlank(string value) => string.IsNullOrWhiteSpace(value) ? "<none>" : value.Trim();
@@ -764,21 +785,9 @@ public sealed class MainForm : Form
             if (_profile.SendMotorFaderFeedback &&
                 live.VolumePercent.HasValue &&
                 !_faderTouched[i] &&
-                DateTime.Now >= _blockMotorFeedbackUntil[i] &&
                 DateTime.Now - _lastFaderTouch[i] > TimeSpan.FromMilliseconds(_profile.MotorFeedbackHoldMs))
             {
-                var feedbackValue = PercentToFourteenBit(live.VolumePercent.Value);
-                if (Math.Abs(feedbackValue - _lastMotorFeedbackValue[i]) > 8)
-                {
-                    _lastMotorFeedbackValue[i] = feedbackValue;
-                    _suppressIncomingFaderUntil[i] = DateTime.Now.AddMilliseconds(1000);
-                    _logger.Debug("Motor feedback ch {0}: {1:0.##}% raw {2}; suppress incoming until {3:HH:mm:ss.fff}",
-                        i + 1,
-                        live.VolumePercent.Value,
-                        feedbackValue,
-                        _suppressIncomingFaderUntil[i]);
-                    _midi.SendPitchBend(i, feedbackValue);
-                }
+                SendMotorFeedback(i, live.VolumePercent.Value, "vMix poll");
             }
 
             if (_profile.SendMackieScribbleStripText && !string.Equals(_lastStripLabels[i], live.Label, StringComparison.Ordinal))
@@ -790,6 +799,40 @@ public sealed class MainForm : Form
             if (live.MeterPercent.HasValue)
                 _midi.SendMackieMeter(i, MeterPercentToMackieLevel(live.MeterPercent.Value));
         }
+    }
+
+    private void SendMotorFeedback(int zeroBasedChannel, double volumePercent, string reason, int suppressMs = 1000)
+    {
+        var feedbackValue = PercentToFourteenBit(volumePercent);
+        if (Math.Abs(feedbackValue - _lastMotorFeedbackValue[zeroBasedChannel]) <= 8)
+            return;
+
+        _lastMotorFeedbackValue[zeroBasedChannel] = feedbackValue;
+        _suppressIncomingFaderUntil[zeroBasedChannel] = DateTime.Now.AddMilliseconds(suppressMs);
+        _logger.Debug("Motor feedback ch {0}: {1:0.##}% raw {2}; reason={3}; suppress incoming until {4:HH:mm:ss.fff}",
+            zeroBasedChannel + 1,
+            volumePercent,
+            feedbackValue,
+            reason,
+            _suppressIncomingFaderUntil[zeroBasedChannel]);
+        _midi.SendPitchBend(zeroBasedChannel, feedbackValue);
+    }
+
+    private async Task SetChannelVolumeFromSurfaceAsync(int zeroBasedChannel, double volumePercent, string reason)
+    {
+        var assignments = ReadAssignmentsFromGrid();
+        if (zeroBasedChannel < 0 || zeroBasedChannel >= assignments.Count)
+            return;
+
+        volumePercent = Math.Clamp(volumePercent, 0, 100);
+        _pendingFaderDirty[zeroBasedChannel] = false;
+        _pendingFaderPercent[zeroBasedChannel] = double.NaN;
+        _lastSentFaderPercent[zeroBasedChannel] = volumePercent;
+
+        _logger.Info("Surface button set channel {0} to {1:0.##}% ({2})", zeroBasedChannel + 1, volumePercent, reason);
+        await _vmix.SetAssignmentVolumeFastAsync(assignments[zeroBasedChannel], volumePercent, _pollCts?.Token ?? CancellationToken.None);
+        SetGridCellValue(zeroBasedChannel, "LiveVolume", volumePercent.ToString("0", CultureInfo.InvariantCulture));
+        SendMotorFeedback(zeroBasedChannel, volumePercent, reason);
     }
 
     private void SetGridCellValue(int rowIndex, string columnName, object value)
@@ -821,6 +864,8 @@ public sealed class MainForm : Form
         _profile.PollIntervalMs = (int)_pollMs.Value;
         _profile.FaderWriteIntervalMs = (int)_faderWriteMs.Value;
         _profile.MotorFeedbackHoldMs = (int)_motorHoldMs.Value;
+        var previousApiPort = _profile.ApiPort;
+        _profile.ApiPort = (int)_apiPort.Value;
         _profile.MidiInputName = _midiInputCombo.Text.Trim();
         _profile.MidiOutputName = _midiOutputCombo.Text.Trim();
         _profile.SendMotorFaderFeedback = _motorFeedback.Checked;
@@ -830,8 +875,159 @@ public sealed class MainForm : Form
         _profile.Channels = ReadAssignmentsFromGrid();
         _profile.Save(AppPaths.ConfigFile);
         ConfigureStartupRegistration();
+        if (_profile.ApiPort != previousApiPort)
+            StartApiServer();
         _logger.Info("Saved profile to {0}", AppPaths.ConfigFile);
     }
+
+    private ApiSnapshot GetApiSnapshotThreadSafe()
+    {
+        if (!InvokeRequired)
+            return BuildApiSnapshot();
+
+        var source = new TaskCompletionSource<ApiSnapshot>();
+        BeginInvoke(new MethodInvoker(() =>
+        {
+            try
+            {
+                source.SetResult(BuildApiSnapshot());
+            }
+            catch (Exception ex)
+            {
+                source.SetException(ex);
+            }
+        }));
+        return source.Task.GetAwaiter().GetResult();
+    }
+
+    private ApiSnapshot BuildApiSnapshot()
+    {
+        var channels = ReadAssignmentsFromGrid().Select(ToApiChannel).ToList();
+        var inputs = _state.Inputs
+            .Select(input => new ApiInput(input.Number, input.Key, input.Title))
+            .ToList();
+        return new ApiSnapshot(
+            channels,
+            inputs,
+            Enum.GetNames<AssignmentKind>(),
+            Enum.GetNames<StripColor>());
+    }
+
+    private Task<ApiAssignmentResponse> SetAssignmentFromApiAsync(int channel, ApiAssignmentRequest request)
+    {
+        var source = new TaskCompletionSource<ApiAssignmentResponse>();
+        BeginInvoke(new MethodInvoker(() =>
+        {
+            try
+            {
+                source.SetResult(ApplyApiAssignment(channel, request));
+            }
+            catch (Exception ex)
+            {
+                _logger.Error(ex, "Assignment API update failed for channel {0}", channel);
+                source.SetResult(new ApiAssignmentResponse(false, ex.Message));
+            }
+        }));
+        return source.Task;
+    }
+
+    private ApiAssignmentResponse ApplyApiAssignment(int channel, ApiAssignmentRequest request)
+    {
+        if (channel is < 1 or > 8)
+            return new ApiAssignmentResponse(false, "Channel must be 1-8.");
+
+        var rowIndex = channel - 1;
+        if (rowIndex >= _grid.Rows.Count)
+            return new ApiAssignmentResponse(false, $"Channel {channel} is not available.");
+
+        var current = ReadAssignmentsFromGrid().FirstOrDefault(assignment => assignment.Channel == channel)
+            ?? new ChannelAssignment { Channel = channel };
+        var kind = current.Kind;
+        if (!string.IsNullOrWhiteSpace(request.Kind) &&
+            !Enum.TryParse(request.Kind, ignoreCase: true, out kind))
+        {
+            return new ApiAssignmentResponse(false, $"Unknown assignment kind '{request.Kind}'.");
+        }
+
+        var inputKey = current.InputKey;
+        if (kind == AssignmentKind.Input)
+        {
+            inputKey = ResolveApiInputKey(request, inputKey);
+            if (string.IsNullOrWhiteSpace(inputKey))
+                return new ApiAssignmentResponse(false, "Input assignments require inputKey, inputNumber, or inputTitle.");
+        }
+        else
+        {
+            inputKey = "";
+        }
+
+        var color = current.StripColor;
+        if (!string.IsNullOrWhiteSpace(request.StripColor) &&
+            !Enum.TryParse(request.StripColor, ignoreCase: true, out color))
+        {
+            return new ApiAssignmentResponse(false, $"Unknown strip color '{request.StripColor}'.");
+        }
+
+        color = NormalizeStripColor(color);
+        var label = request.LabelOverride ?? current.LabelOverride;
+        var assignment = new ChannelAssignment
+        {
+            Channel = channel,
+            Kind = kind,
+            InputKey = inputKey,
+            LabelOverride = label,
+            FollowInputName = string.IsNullOrWhiteSpace(label),
+            StripColor = color
+        };
+
+        _updatingGrid = true;
+        try
+        {
+            _grid.Rows[rowIndex].Cells["Kind"].Value = assignment.Kind;
+            _grid.Rows[rowIndex].Cells["InputKey"].Value = assignment.InputKey ?? "";
+            _grid.Rows[rowIndex].Cells["Label"].Value = assignment.LabelOverride;
+            _grid.Rows[rowIndex].Cells["StripColor"].Value = assignment.StripColor;
+        }
+        finally
+        {
+            _updatingGrid = false;
+        }
+
+        SaveProfile();
+        UpdateInputColumnDataSource();
+        UpdateLiveGridAndHardware();
+        _logger.Info("Assignment API updated channel {0}: kind={1}, inputKey={2}, label='{3}', color={4}",
+            channel,
+            assignment.Kind,
+            assignment.InputKey ?? "",
+            assignment.LabelOverride,
+            assignment.StripColor);
+        return new ApiAssignmentResponse(true, "Assignment updated.", ToApiChannel(assignment));
+    }
+
+    private string? ResolveApiInputKey(ApiAssignmentRequest request, string? currentInputKey)
+    {
+        if (!string.IsNullOrWhiteSpace(request.InputKey))
+        {
+            var input = _state.Inputs.FirstOrDefault(candidate => candidate.Key.Equals(request.InputKey, StringComparison.OrdinalIgnoreCase));
+            return input?.Key ?? request.InputKey;
+        }
+
+        if (request.InputNumber.HasValue)
+            return _state.Inputs.FirstOrDefault(input => input.Number == request.InputNumber.Value)?.Key;
+
+        if (!string.IsNullOrWhiteSpace(request.InputTitle))
+            return _state.Inputs.FirstOrDefault(input => input.Title.Equals(request.InputTitle, StringComparison.OrdinalIgnoreCase))?.Key;
+
+        return currentInputKey;
+    }
+
+    private static ApiChannelAssignment ToApiChannel(ChannelAssignment assignment) => new(
+        assignment.Channel,
+        assignment.Kind.ToString(),
+        assignment.InputKey,
+        assignment.LabelOverride,
+        assignment.StripColor.ToString());
 
     private void ConfigureStartupRegistration()
     {
@@ -971,10 +1167,9 @@ public sealed class MainForm : Form
                 }
 
                 _faderTouched[channel] = touched;
-                _lastFaderTouch[channel] = now;
+                _lastFaderTouch[channel] = touched ? now : DateTime.MinValue;
                 if (!touched)
                 {
-                    _blockMotorFeedbackUntil[channel] = now.AddSeconds(10);
                     _ignoreLocalFaderUntil[channel] = now.AddSeconds(3);
 
                     if (_lastMotorFeedbackValue[channel] >= 0)
@@ -999,7 +1194,6 @@ public sealed class MainForm : Form
                 return;
             }
 
-            var assignments = ReadAssignmentsFromGrid();
             if (e.Command == 0xE0 && e.Channel is >= 0 and < 8)
             {
                 var value14 = e.Data1 | (e.Data2 << 7);
@@ -1032,7 +1226,6 @@ public sealed class MainForm : Form
                 }
 
                 _lastFaderTouch[e.Channel] = now;
-                _blockMotorFeedbackUntil[e.Channel] = now.AddSeconds(10);
                 _lastMotorFeedbackValue[e.Channel] = value14;
                 if (!double.IsNaN(_lastSentFaderPercent[e.Channel]) &&
                     Math.Abs(percent - _lastSentFaderPercent[e.Channel]) < 0.2)
@@ -1047,19 +1240,26 @@ public sealed class MainForm : Form
 
                 _pendingFaderPercent[e.Channel] = percent;
                 _pendingFaderDirty[e.Channel] = true;
-                _logger.Debug("MIDI fader ch {0}: {1:0.##}% raw {2}; motor block until {3:HH:mm:ss.fff}",
+                _logger.Debug("MIDI fader ch {0}: {1:0.##}% raw {2}; touched={3}",
                     e.Channel + 1,
                     percent,
                     value14,
-                    _blockMotorFeedbackUntil[e.Channel]);
+                    _faderTouched[e.Channel]);
                 SetGridCellValue(e.Channel, "LiveVolume", percent.ToString("0", CultureInfo.InvariantCulture));
+                UpdateStatus();
+            }
+            else if (e.Command == 0x90 && e.Data2 > 0 && e.Data1 is >= 0 and <= 7)
+            {
+                var channel = e.Data1;
+                _logger.Debug("MIDI record button ch {0}: set to 0 dB", channel + 1);
+                await SetChannelVolumeFromSurfaceAsync(channel, 100, "record button 0 dB");
                 UpdateStatus();
             }
             else if (e.Command == 0x90 && e.Data2 > 0 && e.Data1 is >= 16 and <= 23)
             {
                 var channel = e.Data1 - 16;
-                _logger.Debug("MIDI mute button ch {0}", channel + 1);
-                await _vmix.ToggleMuteAsync(assignments[channel], _pollCts.Token);
+                _logger.Debug("MIDI mute button ch {0}: set to -inf", channel + 1);
+                await SetChannelVolumeFromSurfaceAsync(channel, 0, "mute button -inf");
                 UpdateStatus();
             }
             else
@@ -1081,7 +1281,6 @@ public sealed class MainForm : Form
         Array.Fill(_lastStripLabels, "");
         Array.Fill(_lastMotorFeedbackValue, -1);
         Array.Fill(_faderTouched, false);
-        Array.Fill(_blockMotorFeedbackUntil, DateTime.MinValue);
         Array.Fill(_ignoreLocalFaderUntil, DateTime.MinValue);
     }
 
@@ -1147,6 +1346,7 @@ public sealed class MainForm : Form
         Disconnect();
         _trayIcon.Visible = false;
         _trayIcon.Dispose();
+        _apiServer.Dispose();
         _vmix.Dispose();
         _midi.Dispose();
         base.OnFormClosing(e);

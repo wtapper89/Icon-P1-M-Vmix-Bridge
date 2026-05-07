@@ -11,6 +11,7 @@ Windows bridge app for controlling vMix audio from an iCON P1-M or compatible Ma
 - Sends basic Mackie meter feedback through channel pressure meter messages.
 - Sends source labels using standard Mackie Control scribble-strip SysEx.
 - Allows each of the 8 strips to be assigned to a vMix input, Master, or buses A-G.
+- Provides a local assignment API on `http://127.0.0.1:8097/api`.
 - Saves assignments automatically to:
 
 ```text
@@ -52,8 +53,39 @@ If the P1-M/D4-T uses a device-specific display variation in your selected mode,
 3. Move the assigned vMix input fader with the mouse.
 4. Confirm the P1-M motor fader follows.
 5. Press the P1-M mute button for strip 1.
-6. Confirm the assigned vMix input audio toggles.
-7. Send the latest log file if any step fails.
+6. Confirm the assigned vMix input volume goes to `0` / `-inf`.
+7. Press the P1-M record button for strip 1.
+8. Confirm the assigned vMix input volume goes to `100` / `0 dB`.
+9. Send the latest log file if any step fails.
+
+## Assignment API
+
+The bridge listens on localhost only. The default port is `8097` and can be changed in the app.
+
+List assignments and currently loaded vMix inputs:
+
+```powershell
+curl http://127.0.0.1:8097/api/assignments
+```
+
+Assign channel 1 to vMix input number 14:
+
+```powershell
+curl -X PUT http://127.0.0.1:8097/api/channels/1 `
+  -H "Content-Type: application/json" `
+  -d "{\"kind\":\"Input\",\"inputNumber\":14,\"stripColor\":\"Green\"}"
+```
+
+Assign channel 8 to Master with a label and color:
+
+```powershell
+curl -X PUT http://127.0.0.1:8097/api/channels/8 `
+  -H "Content-Type: application/json" `
+  -d "{\"kind\":\"Master\",\"labelOverride\":\"MASTER\",\"stripColor\":\"White\"}"
+```
+
+Accepted `kind` values are `None`, `Input`, `Master`, and `BusA` through `BusG`.
+For input assignments, use `inputKey`, `inputNumber`, or `inputTitle`.
 
 ## Build Locally On Windows
 

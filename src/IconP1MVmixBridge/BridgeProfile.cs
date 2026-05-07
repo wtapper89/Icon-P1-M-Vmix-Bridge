@@ -11,6 +11,7 @@ public sealed class BridgeProfile
     public int PollIntervalMs { get; set; } = 100;
     public int FaderWriteIntervalMs { get; set; } = 15;
     public int MotorFeedbackHoldMs { get; set; } = 1800;
+    public int ApiPort { get; set; } = 8097;
     public string MidiInputName { get; set; } = "";
     public string MidiOutputName { get; set; } = "";
     public bool SendMackieScribbleStripText { get; set; } = true;
@@ -60,6 +61,7 @@ public sealed class BridgeProfile
         PollIntervalMs = Math.Clamp(PollIntervalMs, 50, 5000);
         FaderWriteIntervalMs = Math.Clamp(FaderWriteIntervalMs, 10, 500);
         MotorFeedbackHoldMs = Math.Clamp(MotorFeedbackHoldMs, 250, 5000);
+        ApiPort = Math.Clamp(ApiPort, 1, 65535);
 
         var byChannel = Channels
             .Where(c => c.Channel is >= 1 and <= 8)
