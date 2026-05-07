@@ -62,6 +62,7 @@ public sealed class MainForm : Form
     private bool _gridEditing;
     private string _lastInputChoicesSignature = "";
     private int _bankStartChannel;
+    private bool _forceNextHardwareRefresh;
 
     public MainForm(FileLogger logger)
     {
@@ -790,6 +791,8 @@ public sealed class MainForm : Form
         var assignments = ReadAssignmentsFromGrid();
         ClampBankStart(assignments.Count);
         UpdateBankUi();
+        var forceHardwareRefresh = _forceNextHardwareRefresh;
+        _forceNextHardwareRefresh = false;
         _midi.SendIconDisplayColors(GetActiveBankAssignments(assignments).Select(assignment => assignment.StripColor).ToList());
         for (var i = 0; i < assignments.Count; i++)
         {
@@ -818,6 +821,8 @@ public sealed class MainForm : Form
                     _midi.SendMackieScribbleText(physical, "");
                 }
                 _midi.SendMackieMeter(physical, 0);
+                if (_profile.SendMotorFaderFeedback)
+                    SendMotorFeedback(physical, 0, "inactive bank slot", force: forceHardwareRefresh);
                 continue;
             }
 
@@ -826,9 +831,13 @@ public sealed class MainForm : Form
             if (_profile.SendMotorFaderFeedback &&
                 live.VolumePercent.HasValue &&
                 !_faderTouched[physical] &&
-                DateTime.Now - _lastFaderTouch[physical] > TimeSpan.FromMilliseconds(_profile.MotorFeedbackHoldMs))
+                (forceHardwareRefresh || DateTime.Now - _lastFaderTouch[physical] > TimeSpan.FromMilliseconds(_profile.MotorFeedbackHoldMs)))
             {
-                SendMotorFeedback(physical, live.VolumePercent.Value, $"vMix poll logical ch {logical + 1}");
+                SendMotorFeedback(physical, live.VolumePercent.Value, $"vMix poll logical ch {logical + 1}", force: forceHardwareRefresh);
+            }
+            else if (_profile.SendMotorFaderFeedback && !live.VolumePercent.HasValue && !_faderTouched[physical])
+            {
+                SendMotorFeedback(physical, 0, $"no live volume logical ch {logical + 1}", force: forceHardwareRefresh);
             }
 
             if (_profile.SendMackieScribbleStripText && !string.Equals(_lastStripLabels[physical], live.Label, StringComparison.Ordinal))
@@ -839,6 +848,8 @@ public sealed class MainForm : Form
 
             if (live.MeterPercent.HasValue)
                 _midi.SendMackieMeter(physical, MeterPercentToMackieLevel(live.MeterPercent.Value));
+            else
+                _midi.SendMackieMeter(physical, 0);
         }
     }
 
@@ -875,6 +886,7 @@ public sealed class MainForm : Form
         }
 
         ResetHardwareFeedbackCache();
+        _forceNextHardwareRefresh = true;
         UpdateBankUi();
         _logger.Info("Changed active P1-M bank to logical channels {0}-{1}; reason={2}",
             _bankStartChannel + 1,
@@ -897,19 +909,20 @@ public sealed class MainForm : Form
         }
     }
 
-    private void SendMotorFeedback(int zeroBasedChannel, double volumePercent, string reason, int suppressMs = 1000)
+    private void SendMotorFeedback(int zeroBasedChannel, double volumePercent, string reason, int suppressMs = 1000, bool force = false)
     {
         var feedbackValue = PercentToFourteenBit(volumePercent);
-        if (Math.Abs(feedbackValue - _lastMotorFeedbackValue[zeroBasedChannel]) <= 8)
+        if (!force && Math.Abs(feedbackValue - _lastMotorFeedbackValue[zeroBasedChannel]) <= 8)
             return;
 
         _lastMotorFeedbackValue[zeroBasedChannel] = feedbackValue;
         _suppressIncomingFaderUntil[zeroBasedChannel] = DateTime.Now.AddMilliseconds(suppressMs);
-        _logger.Debug("Motor feedback ch {0}: {1:0.##}% raw {2}; reason={3}; suppress incoming until {4:HH:mm:ss.fff}",
+        _logger.Debug("Motor feedback ch {0}: {1:0.##}% raw {2}; reason={3}; force={4}; suppress incoming until {5:HH:mm:ss.fff}",
             zeroBasedChannel + 1,
             volumePercent,
             feedbackValue,
             reason,
+            force,
             _suppressIncomingFaderUntil[zeroBasedChannel]);
         _midi.SendPitchBend(zeroBasedChannel, feedbackValue);
     }
@@ -1439,7 +1452,12 @@ public sealed class MainForm : Form
         Array.Fill(_lastStripLabels, "");
         Array.Fill(_lastMotorFeedbackValue, -1);
         Array.Fill(_faderTouched, false);
+        Array.Fill(_lastFaderTouch, DateTime.MinValue);
         Array.Fill(_ignoreLocalFaderUntil, DateTime.MinValue);
+        Array.Fill(_suppressIncomingFaderUntil, DateTime.MinValue);
+        Array.Fill(_lastSentFaderPercent, double.NaN);
+        Array.Fill(_pendingFaderPercent, double.NaN);
+        Array.Fill(_pendingFaderDirty, false);
     }
 
     private static StripColor NormalizeStripColor(StripColor color) => Enum.IsDefined(color) ? color : StripColor.Blue;
