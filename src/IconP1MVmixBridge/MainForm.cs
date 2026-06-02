@@ -8,6 +8,7 @@ namespace IconP1MVmixBridge;
 
 public sealed class MainForm : Form
 {
+    private const int ReleaseEchoGuardMs = 500;
     private readonly FileLogger _logger;
     private readonly BridgeProfile _profile;
     private readonly VMixClient _vmix;
@@ -1290,15 +1291,16 @@ public sealed class MainForm : Form
                 _lastFaderTouch[channel] = touched ? now : DateTime.MinValue;
                 if (!touched)
                 {
-                    _ignoreLocalFaderUntil[channel] = now.AddSeconds(3);
+                    _ignoreLocalFaderUntil[channel] = now.AddMilliseconds(ReleaseEchoGuardMs);
 
                     if (_lastMotorFeedbackValue[channel] >= 0)
                     {
-                        _suppressIncomingFaderUntil[channel] = now.AddSeconds(3);
-                        _logger.Debug("MIDI fader release hold ch {0}: raw {1}, {2:0.##}%; suppress/ignore until {3:HH:mm:ss.fff}; output open: {4}",
+                        _suppressIncomingFaderUntil[channel] = now.AddMilliseconds(ReleaseEchoGuardMs);
+                        _logger.Debug("MIDI fader release hold ch {0}: raw {1}, {2:0.##}%; release guard {3} ms until {4:HH:mm:ss.fff}; output open: {5}",
                             channel + 1,
                             _lastMotorFeedbackValue[channel],
                             _lastMotorFeedbackValue[channel] / 16383.0 * 100.0,
+                            ReleaseEchoGuardMs,
                             _suppressIncomingFaderUntil[channel],
                             _midi.OutputOpen);
                         _midi.SendPitchBend(channel, _lastMotorFeedbackValue[channel]);
