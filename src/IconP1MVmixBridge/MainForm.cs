@@ -8,7 +8,9 @@ namespace IconP1MVmixBridge;
 
 public sealed class MainForm : Form
 {
-    private const int ReleaseEchoGuardMs = 500;
+    private const int ReleaseEchoGuardMs = 100;
+    private const int MotorEchoSuppressMs = 250;
+    private const int UntouchedAutoGrabRawDelta = 96;
     private readonly FileLogger _logger;
     private readonly BridgeProfile _profile;
     private readonly VMixClient _vmix;
@@ -910,7 +912,7 @@ public sealed class MainForm : Form
         }
     }
 
-    private void SendMotorFeedback(int zeroBasedChannel, double volumePercent, string reason, int suppressMs = 1000, bool force = false)
+    private void SendMotorFeedback(int zeroBasedChannel, double volumePercent, string reason, int suppressMs = MotorEchoSuppressMs, bool force = false)
     {
         var feedbackValue = PercentToFourteenBit(volumePercent);
         if (!force && Math.Abs(feedbackValue - _lastMotorFeedbackValue[zeroBasedChannel]) <= 8)
@@ -1356,8 +1358,25 @@ public sealed class MainForm : Form
 
                 if (_profile.InputFadersAreTouchSensitive && !_faderTouched[e.Channel])
                 {
-                    _logger.Debug("Ignored untouched fader ch {0}: {1:0.##}% raw {2}", e.Channel + 1, percent, value14);
-                    return;
+                    var rawDelta = _lastMotorFeedbackValue[e.Channel] < 0
+                        ? int.MaxValue
+                        : Math.Abs(value14 - _lastMotorFeedbackValue[e.Channel]);
+                    if (rawDelta < UntouchedAutoGrabRawDelta)
+                    {
+                        _logger.Debug("Ignored untouched fader ch {0}: {1:0.##}% raw {2}; raw delta {3}",
+                            e.Channel + 1,
+                            percent,
+                            value14,
+                            rawDelta);
+                        return;
+                    }
+
+                    _faderTouched[e.Channel] = true;
+                    _logger.Debug("Auto-grabbed fader ch {0}: {1:0.##}% raw {2}; raw delta {3}; touch message was late/missing",
+                        e.Channel + 1,
+                        percent,
+                        value14,
+                        rawDelta);
                 }
 
                 _lastFaderTouch[e.Channel] = now;
