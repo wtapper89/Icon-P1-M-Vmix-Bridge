@@ -2,7 +2,8 @@ name: Build Windows App
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
+  pull_request:
   workflow_dispatch:
 
 jobs:
@@ -13,29 +14,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup .NET
-        uses: actions/setup-dotnet@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          dotnet-version: 8.0.x
+          python-version: "3.13"
 
-      - name: Restore
-        run: dotnet restore src/IconP1MVmixBridge/IconP1MVmixBridge.csproj
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
 
-      - name: Build
-        run: dotnet build src/IconP1MVmixBridge/IconP1MVmixBridge.csproj -c Release --no-restore
+      - name: Run controller tests
+        run: python -m unittest discover -s tests -v
 
-      - name: Publish single exe
-        run: >
-          dotnet publish src/IconP1MVmixBridge/IconP1MVmixBridge.csproj
-          -c Release
-          -r win-x64
-          --self-contained true
-          -p:PublishSingleFile=true
-          -p:EnableCompressionInSingleFile=true
-          -o artifacts/win-x64
+      - name: Build setup executable
+        shell: powershell
+        run: .\build-installer.ps1
 
-      - name: Upload executable artifact
+      - name: Upload setup executable
         uses: actions/upload-artifact@v4
         with:
-          name: IconP1MVmixBridge-win-x64
-          path: artifacts/win-x64/**
+          name: VMixMidiSurfaceBridge-Setup
+          path: release/VMixMidiSurfaceBridge-Setup.exe
