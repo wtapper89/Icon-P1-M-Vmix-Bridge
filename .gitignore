@@ -1,8 +1,9 @@
-bin/
-obj/
-.vs/
+__pycache__/
+*.py[cod]
+.venv/
+config.json
+logs/
+artifacts/
 *.user
 *.suo
 *.log
-artifacts/
-publish/

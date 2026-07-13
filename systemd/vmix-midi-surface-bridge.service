@@ -1,0 +1,18 @@
+[Unit]
+Description=vMix MIDI Surface Bridge
+After=network-online.target sound.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/vmix-xtouch-bridge
+ExecStart=/opt/vmix-xtouch-bridge/.venv/bin/python /opt/vmix-xtouch-bridge/app.py
+Restart=on-failure
+RestartSec=3
+User=pi
+Group=pi
+Environment=PYTHONUNBUFFERED=1
+Environment=VMIX_MIDI_SURFACE_CONFIG=/etc/vmix-xtouch-bridge/config.json
+
+[Install]
+WantedBy=multi-user.target
