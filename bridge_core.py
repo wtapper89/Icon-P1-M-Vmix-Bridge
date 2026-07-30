@@ -14,7 +14,7 @@ from pathlib import Path
 import mido
 
 
-ASSIGNMENT_KINDS = ["none", "input", "master", "busA", "busB", "busC", "busD", "busE", "busF", "busG"]
+ASSIGNMENT_KINDS = ["none", "input", "program", "preview", "master", "busA", "busB", "busC", "busD", "busE", "busF", "busG"]
 STRIP_COLORS = ["off", "white", "red", "orange", "yellow", "green", "cyan", "blue", "purple", "pink"]
 CONTROLLER_TYPES = ["icon_p1m", "behringer_xtouch", "mackie_control"]
 ICON_RGB = {
@@ -305,7 +305,10 @@ class ConfigStore:
 class VMixClient:
     def __init__(self):
         self.lock = threading.Lock()
-        self.state = {"connected": False, "status": "Not polled yet", "inputs": [], "outputs": {}}
+        self.state = {
+            "connected": False, "status": "Not polled yet", "inputs": [], "outputs": {},
+            "active": 0, "preview": 0,
+        }
 
     @staticmethod
     def base_url(config):
@@ -340,9 +343,23 @@ class VMixClient:
                         suffix = "meterf1" if lower.endswith("meterf1") else "meterf2"
                         name = lower[:-len(suffix)]
                         outputs.setdefault(name, {})["meter"] = max(outputs.get(name, {}).get("meter", 0), float(value or 0))
-            state = {"connected": True, "status": f"Connected. {len(inputs)} inputs.", "inputs": inputs, "outputs": outputs}
+            def input_number(tag):
+                node = root.find(f"./{tag}")
+                try:
+                    return int((node.text or "0").strip()) if node is not None else 0
+                except (TypeError, ValueError):
+                    return 0
+
+            state = {
+                "connected": True, "status": f"Connected. {len(inputs)} inputs.",
+                "inputs": inputs, "outputs": outputs,
+                "active": input_number("active"), "preview": input_number("preview"),
+            }
         except Exception as exc:
-            state = {"connected": False, "status": str(exc), "inputs": [], "outputs": {}}
+            state = {
+                "connected": False, "status": str(exc), "inputs": [], "outputs": {},
+                "active": 0, "preview": 0,
+            }
         with self.lock:
             self.state = state
         return deepcopy(state)
@@ -631,11 +648,21 @@ class Bridge:
                 return item
         return None
 
-    def live_for(self, assignment, state=None):
+    def _resolved_input_for(self, assignment, state=None):
         state = state or self.vmix.get_state()
         kind = assignment.get("kind", "none")
         if kind == "input":
-            item = self._input_for(assignment, state)
+            return self._input_for(assignment, state)
+        if kind in ("program", "preview"):
+            number = state.get("active" if kind == "program" else "preview", 0)
+            return next((item for item in state.get("inputs", []) if item.get("number") == number), None)
+        return None
+
+    def live_for(self, assignment, state=None):
+        state = state or self.vmix.get_state()
+        kind = assignment.get("kind", "none")
+        if kind in ("input", "program", "preview"):
+            item = self._resolved_input_for(assignment, state)
             return {"volume": item.get("volume"), "meter": item.get("meter", 0), "muted": item.get("muted", False)} if item else {"volume": None, "meter": 0, "muted": False}
         name = kind.lower()
         output = state.get("outputs", {}).get(name, {})
@@ -644,9 +671,11 @@ class Bridge:
     def label_for(self, assignment, state=None):
         if assignment.get("label_override") and not assignment.get("follow_input_name", False):
             return assignment["label_override"]
-        if assignment.get("kind") == "input":
-            item = self._input_for(assignment, state or self.vmix.get_state())
-            return item.get("title", "") if item else assignment.get("label_override") or "Input"
+        kind = assignment.get("kind", "none")
+        if kind in ("input", "program", "preview"):
+            item = self._resolved_input_for(assignment, state)
+            fallback = {"input": "Input", "program": "PGM", "preview": "PVW"}[kind]
+            return item.get("title", "") if item else assignment.get("label_override") or fallback
         return assignment.get("label_override") or assignment.get("kind", "none")
 
     @staticmethod
@@ -937,6 +966,12 @@ class Bridge:
 
     def _function_for(self, assignment, action):
         kind = assignment.get("kind", "none")
+        if kind in ("program", "preview"):
+            item = self._resolved_input_for(assignment)
+            if not item:
+                return "", {}
+            kind = "input"
+            assignment = {"kind": "input", "input_key": item.get("key"), "input_number": item.get("number")}
         suffix = kind[3:].upper() if kind.lower().startswith("bus") else ""
         if action == "volume":
             if kind == "input":

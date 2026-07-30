@@ -69,11 +69,15 @@ Do not choose `Microsoft GS Wavetable Synth` as a controller output.
 The Channel Assignments table is shared by all controllers. Each row can control:
 
 - A vMix input
+- The source currently in Program (PGM)
+- The source currently in Preview (PVW)
 - Master
 - Bus A through Bus G
 - Nothing
 
 For each channel, choose an assignment, select the vMix input when needed, optionally enter a short label override, and choose a strip color. The highlighted eight rows are the bank currently shown on the selected controller.
+
+Program and Preview assignments follow vMix dynamically. After a cut or preview selection, the surface label, meter, motor fader, Record/Mute buttons, and fader movement automatically target the newly selected source.
 
 Use **Bank left**, **Bank right**, controller bank buttons, or the X-Touch jog wheel to move through additional channels.
 
