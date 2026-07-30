@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 import mido
 
-from bridge_core import Bridge, ControllerRuntime, default_channel, default_controller
+from bridge_core import Bridge, ControllerRuntime, VMixClient, default_channel, default_controller
 
 
 class FakePort:
@@ -18,6 +18,20 @@ class FakePort:
 
     def send(self, message):
         self.sent.append(message)
+
+
+class FakeResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def read(self):
+        return self.body
 
 
 class FakeStore:
@@ -49,6 +63,57 @@ class FakeStore:
 
 
 class BridgeCoreTests(unittest.TestCase):
+    def test_vmix_poll_reads_program_and_preview_input_numbers(self):
+        xml = b"""<vmix><preview>2</preview><active>1</active><inputs>
+            <input number="1" key="camera" title="Camera" volume="72" meterF1="0.2" />
+            <input number="2" key="slides" title="Slides" volume="41" meterF1="0.1" />
+        </inputs></vmix>"""
+        client = VMixClient()
+
+        with patch("bridge_core.urllib.request.urlopen", return_value=FakeResponse(xml)):
+            state = client.poll({"vmix_host": "127.0.0.1", "vmix_http_port": 8088})
+
+        self.assertEqual(state["active"], 1)
+        self.assertEqual(state["preview"], 2)
+
+    def test_program_and_preview_assignments_follow_current_sources(self):
+        bridge = Bridge(FakeStore())
+        state = {
+            "active": 1,
+            "preview": 2,
+            "inputs": [
+                {"number": 1, "key": "camera", "title": "Camera", "volume": 72, "meter": 0.2, "muted": False},
+                {"number": 2, "key": "slides", "title": "Slides", "volume": 41, "meter": 0.1, "muted": True},
+            ],
+            "outputs": {},
+        }
+
+        self.assertEqual(bridge.label_for({"kind": "program"}, state), "Camera")
+        self.assertEqual(bridge.live_for({"kind": "program"}, state)["volume"], 72)
+        self.assertEqual(bridge.label_for({"kind": "preview"}, state), "Slides")
+        self.assertTrue(bridge.live_for({"kind": "preview"}, state)["muted"])
+
+        state["active"] = 2
+        self.assertEqual(bridge.label_for({"kind": "program"}, state), "Slides")
+
+    def test_dynamic_fader_writes_target_current_program_and_preview_keys(self):
+        bridge = Bridge(FakeStore())
+        bridge.vmix.state = {
+            "connected": True, "status": "Connected", "active": 1, "preview": 2,
+            "inputs": [
+                {"number": 1, "key": "camera", "title": "Camera"},
+                {"number": 2, "key": "slides", "title": "Slides"},
+            ],
+            "outputs": {},
+        }
+
+        with patch.object(bridge.vmix, "send_function") as send:
+            bridge.set_assignment_volume({"kind": "program"}, 63)
+            bridge.set_assignment_volume({"kind": "preview"}, 27)
+
+        self.assertEqual(send.call_args_list[0].args[1:], ("SetVolume", {"Input": "camera", "Value": 63}))
+        self.assertEqual(send.call_args_list[1].args[1:], ("SetVolume", {"Input": "slides", "Value": 27}))
+
     def test_xtouch_hotplug_does_not_reopen_icon(self):
         icon_profile = default_controller(1, "icon_p1m")
         xtouch_profile = default_controller(2, "behringer_xtouch")
